@@ -234,7 +234,7 @@ int open_evdi_lindroid_or_create() {
     evdi_add << "1";
     evdi_add.close();
 
-    sleep(1);
+    sleep(2);
     fd = find_evdi_lindroid_device();
     if (fd < 0) {
         std::cerr << "evdi-lindroid still not available after add attempt." << std::endl;
