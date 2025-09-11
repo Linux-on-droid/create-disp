@@ -179,6 +179,12 @@ bool is_evdi_lindroid(int fd) {
     return false;
 }
 
+bool ends_with_card(const std::string& str) {
+    const std::string suffix = "-card";
+    if (str.size() < suffix.size()) return false;
+    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 int find_evdi_lindroid_device() {
     const std::string dri_path = "/dev/dri/by-path/";
     std::vector<std::string> candidates;
@@ -186,7 +192,9 @@ int find_evdi_lindroid_device() {
     if (DIR* dir = opendir(dri_path.c_str())) {
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
-        	candidates.emplace_back(dri_path + entry->d_name);
+			if (ends_with_card(entry->d_name)) {
+        		candidates.emplace_back(dri_path + entry->d_name);
+			}
         }
         closedir(dir);
     }
