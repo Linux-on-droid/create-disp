@@ -180,15 +180,13 @@ bool is_evdi_lindroid(int fd) {
 }
 
 int find_evdi_lindroid_device() {
-    const std::string dri_path = "/dev/dri/";
+    const std::string dri_path = "/dev/dri/by-path/";
     std::vector<std::string> candidates;
 
     if (DIR* dir = opendir(dri_path.c_str())) {
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
-            if (strncmp(entry->d_name, "card", 4) == 0) {
-                candidates.emplace_back(dri_path + entry->d_name);
-            }
+        	candidates.emplace_back(dri_path + entry->d_name);
         }
         closedir(dir);
     }
