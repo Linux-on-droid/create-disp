@@ -9,6 +9,12 @@ NotifyAccess=main
 Restart=always
 RestartSec=1
 User=lindroid
+LimitRTPRIO=10
+LimitMEMLOCK=infinity
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=3
+MemoryDenyWriteExecute=no
+LimitNOFILE=65536
 ExecStart=/usr/bin/create-disp
 
 [Install]
