@@ -67,6 +67,7 @@ struct HandleInfo {
     int id;
 };
 
+int drm_fd;
 hwc2_compat_display_t* hwcDisplay;
 hwc2_compat_device_t* hwcDevice;
 static std::unordered_map<int, std::unique_ptr<RemoteWindowBuffer>> buffers_map;
@@ -283,6 +284,8 @@ int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint
     return 0;
 }
 
+int update_display();
+
 void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
                      hwc2_display_t display, int64_t timestamp)
 {
@@ -303,6 +306,9 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
 void onRefreshReceived(HWC2EventListener* listener,
                        int32_t sequenceId, hwc2_display_t display)
 {
+    printf("onRefreshReceived\n");
+    if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
+        update_display();
 }
 
 HWC2EventListener eventListener = {
@@ -411,6 +417,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 	} else { buf = it_buf->second.get(); }
 	}
 	hwc2_error_t error;
+    if(buf->width > global_width, buf->height > global_height)
+        goto done;
         hwc2_compat_display_set_client_target(hwcDisplay, /* slot */0, buf,
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
@@ -468,6 +476,41 @@ static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg
     return hz_from_period_ns(cfg->vsyncPeriod);
 }
 
+int update_display() {
+     HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
+
+    printf("width: %i height: %i\n", config->width, config->height);
+    if(global_width != config->width || global_height != config->height) {
+        global_width = config->width;
+        global_height = config->height;
+        buffer_handle_t handle = NULL;
+
+        hybris_gralloc_allocate(global_width, global_height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &handle, &global_stride);
+
+        layer = hwc2_compat_display_create_layer(hwcDisplay);
+
+        hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
+        hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
+        hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
+                                        config->height);
+        hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
+                                            config->height);
+        hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
+                                            config->height);
+
+        int refresh_hz = get_refresh_hz_from_active_config(config);
+
+        std::cout << "EDID for " << config->width << "x" << config->height
+             << "@" << refresh_hz << "Hz 'Lindroid display' written successfully."
+             << std::endl;
+
+        if (evdi_connect(drm_fd, 0, config->width, config->height, refresh_hz) < 0) {
+            return EXIT_FAILURE;
+        }
+    }
+    return 0;
+}
+
 int main() {
     int device_index = 0;
     int composerSequenceId = 0;
@@ -491,41 +534,14 @@ int main() {
 
     hwc2_compat_display_set_power_mode(hwcDisplay, HWC2_POWER_MODE_ON);
 
-    HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
-
-    printf("width: %i height: %i\n", config->width, config->height);
-    global_width = config->width;
-    global_height = config->height;
-    buffer_handle_t handle = NULL;
-
-    ret = hybris_gralloc_allocate(global_width, global_height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &handle, &global_stride);
-
-    layer = hwc2_compat_display_create_layer(hwcDisplay);
-
-    hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
-    hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
-    hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
-                                      config->height);
-    hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
-                                        config->height);
-    hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
-                                         config->height);
-
-    int fd = open_evdi_lindroid_or_create();
-    if (fd < 0) {
+    drm_fd = open_evdi_lindroid_or_create();
+    if (drm_fd < 0) {
         return EXIT_FAILURE;
     }
 
-    int refresh_hz = get_refresh_hz_from_active_config(config);
-
-    if (evdi_connect(fd, device_index, config->width, config->height, refresh_hz) < 0) {
-        close(fd);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "EDID for " << config->width << "x" << config->height
-              << "@" << refresh_hz << "Hz 'Lindroid display' written successfully."
-              << std::endl;
+    ret = update_display();
+    if(ret)
+        return ret;
 
     sd_notify(0, "READY=1");
     sd_notify(0, "STATUS=create-disp ready.");
@@ -534,31 +550,31 @@ int main() {
     poll_cmd.data = malloc(1024);
 
     while (true) {
-        ret = ioctl(fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
+        ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
         if(ret)
             continue;
 	printf("Got event: %d\n", poll_cmd.event);
         switch(poll_cmd.event) {
            case add_buf:
-               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, fd);
+               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
                break;
            case get_buf:
-               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, fd);
+               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
                break;
            case swap_to:
-               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
                break;
            case destroy_buf:
-               destroy_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               destroy_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
                break;
 	   case create_buf:
-               create_buff(poll_cmd.data, poll_cmd.poll_id, fd);
+               create_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
                break;
         }
     }
 
     free(poll_cmd.data);
-    close(fd);
+    close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
     return EXIT_SUCCESS;
 }
