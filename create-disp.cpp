@@ -721,7 +721,6 @@ int main() {
         ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
         if(ret)
             continue;
-	printf("Got event: %d\n", poll_cmd.event);
         switch(poll_cmd.event) {
            case add_buf:
                add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
@@ -739,6 +738,8 @@ int main() {
                create_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
                break;
         }
+	//uncomment for debugging
+	//printf("Got event: %d\n", poll_cmd.event);
     }
 
     free(poll_cmd.data);
