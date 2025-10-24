@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
+#include <sstream>
 #include <cstring>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <cassert>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <fstream>
 #include <cmath>
@@ -61,6 +63,31 @@
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
 
+static const int kMaxDriverDisplays = 5;
+static std::unordered_map<long long, int> g_hwc_to_drv;
+static std::unordered_map<int, long long> g_drv_to_hwc;
+static std::vector<int> g_free_drv_ids;
+static volatile bool drm_ready = false;
+
+struct Display {
+    int display_id = -1;
+    int width = 0;
+    int height = 0;
+    uint32_t stride = 0;
+    hwc2_compat_display_t* hwcDisplay = nullptr;
+    hwc2_compat_layer_t* layer = nullptr;
+};
+
+static std::unordered_map<int, Display> g_displays;
+
+static inline Display& get_or_create_display(int display_id) {
+    auto it = g_displays.find(display_id);
+    if (it != g_displays.end()) return it->second;
+    Display d;
+    d.display_id = display_id;
+    g_displays.emplace(display_id, d);
+    return g_displays[display_id];
+}
 
 struct HandleInfo {
     std::unique_ptr<native_handle_t> handle;
@@ -68,7 +95,6 @@ struct HandleInfo {
 };
 
 int drm_fd;
-hwc2_compat_display_t* hwcDisplay;
 hwc2_compat_device_t* hwcDevice;
 static std::unordered_map<int, std::unique_ptr<RemoteWindowBuffer>> buffers_map;
 static std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
@@ -84,10 +110,7 @@ static inline std::string make_handle_key(const native_handle_t* h) {
 	memcpy(&key[off], &h->data[h->numFds], total_ints * sizeof(int));
 	return key;
 }
-int global_width, global_height;
-uint32_t global_stride;
 int next_id = 0;
-hwc2_compat_layer_t* layer;
 enum poll_event_type {
     none,
     add_buf,
@@ -107,6 +130,7 @@ struct drm_evdi_connect {
         uint32_t width;
         uint32_t height;
         uint32_t refresh_rate;
+        uint32_t display_id;
 };
 
 struct drm_evdi_poll {
@@ -173,6 +197,14 @@ int add_handle(const native_handle_t& handle) {
 native_handle_t* get_handle(int id) {
     auto it = handles_map.find(id);
     return (it != handles_map.end()) ? it->second.get() : nullptr;
+}
+
+static inline void init_free_driver_slots_once() {
+    if (!g_free_drv_ids.empty()) return;
+    g_free_drv_ids.reserve(kMaxDriverDisplays);
+    for (int i = kMaxDriverDisplays - 1; i >= 0; --i) {
+        g_free_drv_ids.push_back(i);
+    }
 }
 
 static int drm_auth_magic(int fd, drm_magic_t magic) {
@@ -267,13 +299,17 @@ int open_evdi_lindroid_or_create() {
     return -1;
 }
 
-int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint32_t refresh_rate) {
+static inline int evdi_connect(int fd, int device_index,
+                               uint32_t width, uint32_t height,
+                               uint32_t refresh_rate, uint32_t display_id,
+                               int connected) {
     drm_evdi_connect cmd = {
-        .connected = 1,
+        .connected = connected,
         .dev_index = device_index,
         .width = width,
         .height = height,
         .refresh_rate = refresh_rate,
+        .display_id = display_id,
     };
 
     if (ioctl(fd, DRM_IOCTL_EVDI_CONNECT, &cmd) < 0) {
@@ -284,11 +320,36 @@ int evdi_connect(int fd, int device_index, uint32_t width, uint32_t height, uint
     return 0;
 }
 
-int update_display();
+int update_display(int display_id);
 
 void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
                      hwc2_display_t display, int64_t timestamp)
 {
+}
+
+static inline int drv_id_for_hwc(long long hwc_id) {
+    auto it = g_hwc_to_drv.find(hwc_id);
+    return it == g_hwc_to_drv.end() ? -1 : it->second;
+}
+
+static inline int alloc_driver_slot_for_hwc(long long hwc_id) {
+    int drv = drv_id_for_hwc(hwc_id);
+    if (drv >= 0) return drv;
+    if (g_free_drv_ids.empty()) return -1;
+    drv = g_free_drv_ids.back();
+    g_free_drv_ids.pop_back();
+    g_hwc_to_drv[hwc_id] = drv;
+    g_drv_to_hwc[drv] = hwc_id;
+    return drv;
+}
+
+static inline void release_driver_slot_for_hwc(long long hwc_id) {
+    auto it = g_hwc_to_drv.find(hwc_id);
+    if (it == g_hwc_to_drv.end()) return;
+    int drv = it->second;
+    g_hwc_to_drv.erase(it);
+    g_drv_to_hwc.erase(drv);
+    g_free_drv_ids.push_back(drv);
 }
 
 void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
@@ -296,19 +357,59 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
                        bool primaryDisplay)
 {
         printf("onHotplugReceived(%d, %" PRIu64 ", %s, %s)\n",
-                sequenceId, display,
-                connected ? "connected" : "disconnected",
-                primaryDisplay ? "primary" : "external");
+               sequenceId, display,
+               connected ? "connected" : "disconnected",
+               primaryDisplay ? "primary" : "external");
 
         hwc2_compat_device_on_hotplug(hwcDevice, display, connected);
+        init_free_driver_slots_once();
+
+        const long long hwc_id = (long long)display;
+        int drv_id = drv_id_for_hwc(hwc_id);
+
+        if (connected) {
+            if (drv_id < 0) {
+                drv_id = alloc_driver_slot_for_hwc(hwc_id);
+                if (drv_id < 0) {
+                    std::cerr << "No free driver display slots; ignoring hotplug for HWC id " << hwc_id << std::endl;
+                    return;
+                }
+            }
+            Display& D = get_or_create_display(drv_id);
+            D.display_id = drv_id;
+            D.hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, display);
+            if (!D.hwcDisplay) {
+                std::cerr << "HWC display handle not available for id " << hwc_id << std::endl;
+                return;
+            }
+            hwc2_compat_display_set_power_mode(D.hwcDisplay, HWC2_POWER_MODE_ON);
+            if (drm_ready && drm_fd >= 0) {
+                update_display(drv_id);
+            } else {
+                printf("Deferring CONNECT for driver slot %d (HWC %" PRIu64 ")\n",
+                       drv_id, (uint64_t)hwc_id);
+            }
+        } else {
+            if (drv_id < 0) return;
+            Display& D = get_or_create_display(drv_id);
+            evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)drv_id, 0);
+            if (D.layer) D.layer = nullptr;
+            D.width = D.height = 0;
+            D.stride = 0;
+            release_driver_slot_for_hwc(hwc_id);
+        }
 }
 
 void onRefreshReceived(HWC2EventListener* listener,
                        int32_t sequenceId, hwc2_display_t display)
 {
-    printf("onRefreshReceived\n");
-    if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
-        update_display();
+    const long long hwc_id = (long long)display;
+    int drv_id = drv_id_for_hwc(hwc_id);
+    if (drv_id < 0) return;
+    printf("onRefreshReceived (HWC %" PRIu64 ") -> driver slot %d\n", (uint64_t)hwc_id, drv_id);
+    Display& D = get_or_create_display(drv_id);
+    if (D.hwcDisplay)
+        update_display(drv_id);
 }
 
 HWC2EventListener eventListener = {
@@ -348,7 +449,7 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
                         ((numFds + numInts) * sizeof(int));
     native_handle_t *full_handle = (native_handle_t*)malloc(total_size);
     if (!full_handle) {
-        printf("malloc failed size: %d\n", total_size);
+        printf("malloc failed size: %zu\n", total_size);
         return;
     }
     if(read(fd, full_handle, total_size) != total_size) {
@@ -392,52 +493,80 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-        const native_handle_t* out_handle = NULL;
-        int id;
-        int ret;
-        memcpy(&id, data, sizeof(int));
+    const native_handle_t* out_handle = NULL;
+    struct { int id; int display_id; } ex = { -1, 0 };
+    int ret;
+    memcpy(&ex, data, sizeof(ex));
+    const int id = ex.id;
+    const int drv_display_id = ex.display_id;
 
-        buffer_handle_t in_handle = get_handle(id);
-        RemoteWindowBuffer *buf;
+    buffer_handle_t in_handle = get_handle(id);
+    RemoteWindowBuffer *buf = nullptr;
+    if (in_handle == nullptr) {
+        printf("Failed to find buf: %d\n", id);
+        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
+        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        return;
+    }
 
-        if(in_handle == nullptr) {
-                printf("Failed to find buf: %d\n", id);
-                goto done;
-        } 
+    Display& D = get_or_create_display(drv_display_id);
+    if (!D.hwcDisplay || D.width == 0 || D.height == 0) {
+        printf("Display %d not ready (no HWC or size)\n", drv_display_id);
+        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
+        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        return;
+    }
+    if (g_drv_to_hwc.find(drv_display_id) == g_drv_to_hwc.end()) {
+        struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
+        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        return;
+    }
 
-	{
-	auto it_buf = buffers_map.find(id);
-	if (it_buf == buffers_map.end()) {
-		auto new_buf = std::make_unique<RemoteWindowBuffer>(
-			global_width, global_height, global_stride,
-			HAL_PIXEL_FORMAT_RGBA_8888,
-			GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-		buf = new_buf.get();
-		buffers_map[id] = std::move(new_buf);
-	} else { buf = it_buf->second.get(); }
-	}
-	hwc2_error_t error;
-    if(buf->width > global_width, buf->height > global_height)
-        goto done;
-        hwc2_compat_display_set_client_target(hwcDisplay, /* slot */0, buf,
+    {
+        auto it_buf = buffers_map.find(id);
+        if (it_buf == buffers_map.end()) {
+            auto new_buf = std::make_unique<RemoteWindowBuffer>(
+                D.width, D.height, D.stride,
+                HAL_PIXEL_FORMAT_RGBA_8888,
+                GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
+            buf = new_buf.get();
+            buffers_map[id] = std::move(new_buf);
+        } else {
+            buf = it_buf->second.get();
+            if (buf->width != D.width || buf->height != D.height) {
+                auto new_buf = std::make_unique<RemoteWindowBuffer>(
+                    D.width, D.height, D.stride,
+                    HAL_PIXEL_FORMAT_RGBA_8888,
+                    GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
+                buf = new_buf.get();
+                buffers_map[id] = std::move(new_buf);
+            }
+        }
+    }
+    hwc2_error_t error;
+    if (buf->width > D.width || buf->height > D.height) {
+        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
+        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        return;
+    }
+    hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
 
-        int presentFence;
-        error =hwc2_compat_display_present(hwcDisplay, &presentFence);
-	if (error != HWC2_ERROR_NONE) {
-		std::cerr << "Failed to present display: " << error << std::endl;
-	}
-done:
-	struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+    int presentFence;
+    error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
+    if (error != HWC2_ERROR_NONE) {
+        std::cerr << "Failed to present display: " << error << std::endl;
+    }
+    struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
+    ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
         const native_handle_t* out_handle = NULL;
         int id = *(int *)data;
         int ret;
-        native_handle *handle = get_handle(id);
+        native_handle_t *handle = get_handle(id);
         if(handle) {
                 native_handle_close(handle);
         }
@@ -475,36 +604,66 @@ static inline int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg
 {
     return hz_from_period_ns(cfg->vsyncPeriod);
 }
+int update_display(int display_id) {
+    Display& D = get_or_create_display(display_id);
+    if (!D.hwcDisplay) return -1;
+    HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(D.hwcDisplay);
+    if (!config) {
+        fprintf(stderr, "update_display(%d): no active HWC config yet, will retry on next refresh\n",
+                display_id);
+        return -1;
+    }
 
-int update_display() {
-     HWC2DisplayConfig* config = hwc2_compat_display_get_active_config(hwcDisplay);
+    if (!D.hwcDisplay) {
+        long long hwc_id = g_drv_to_hwc[display_id];
+        D.hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, (hwc2_display_t)hwc_id);
+        if (D.hwcDisplay) hwc2_compat_display_set_power_mode(D.hwcDisplay, HWC2_POWER_MODE_ON);
+    }
 
-    printf("width: %i height: %i\n", config->width, config->height);
-    if(global_width != config->width || global_height != config->height) {
-        global_width = config->width;
-        global_height = config->height;
+    if (config->width <= 0 || config->height <= 0) {
+        fprintf(stderr, "update_display(%d): invalid geometry %dx%d, deferring\n",
+                display_id, config->width, config->height);
+        return -1;
+    }
+
+    if (!drm_ready || drm_fd < 0) {
+        fprintf(stderr, "update_display(%d): DRM not ready, deferring CONNECT\n", display_id);
+        return -1;
+    }
+
+    printf("display %d width: %i height: %i\n", display_id, config->width, config->height);
+    if (D.width != config->width || D.height != config->height) {
+        buffers_map.clear();
+        D.width = config->width;
+        D.height = config->height;
         buffer_handle_t handle = NULL;
 
-        hybris_gralloc_allocate(global_width, global_height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &handle, &global_stride);
+        hybris_gralloc_allocate(D.width, D.height, HAL_PIXEL_FORMAT_RGBA_8888,
+                                GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
+                                &handle, &D.stride);
 
-        layer = hwc2_compat_display_create_layer(hwcDisplay);
+        if (D.layer) {
+            hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
+            D.layer = nullptr;
+        }
+        D.layer = hwc2_compat_display_create_layer(D.hwcDisplay);
 
-        hwc2_compat_layer_set_composition_type(layer, HWC2_COMPOSITION_CLIENT);
-        hwc2_compat_layer_set_blend_mode(layer, HWC2_BLEND_MODE_NONE);
-        hwc2_compat_layer_set_source_crop(layer, 0.0f, 0.0f, config->width,
-                                        config->height);
-        hwc2_compat_layer_set_display_frame(layer, 0, 0, config->width,
-                                            config->height);
-        hwc2_compat_layer_set_visible_region(layer, 0, 0, config->width,
-                                            config->height);
+        hwc2_compat_layer_set_composition_type(D.layer, HWC2_COMPOSITION_CLIENT);
+        hwc2_compat_layer_set_blend_mode(D.layer, HWC2_BLEND_MODE_NONE);
+        hwc2_compat_layer_set_source_crop(D.layer, 0.0f, 0.0f, config->width, config->height);
+        hwc2_compat_layer_set_display_frame(D.layer, 0, 0, config->width, config->height);
+        hwc2_compat_layer_set_visible_region(D.layer, 0, 0, config->width, config->height);
 
         int refresh_hz = get_refresh_hz_from_active_config(config);
 
-        std::cout << "EDID for " << config->width << "x" << config->height
-             << "@" << refresh_hz << "Hz 'Lindroid display' written successfully."
-             << std::endl;
+        std::ostringstream oss;
+        oss << "EDID for " << config->width << "x" << config->height
+            << "@" << refresh_hz << "Hz 'Lindroid display " << display_id << "'";
+        std::cout << oss.str() << std::endl;
 
-        if (evdi_connect(drm_fd, 0, config->width, config->height, refresh_hz) < 0) {
+        if (evdi_connect(drm_fd, 0,
+                         (uint32_t)config->width, (uint32_t)config->height,
+                         (uint32_t)refresh_hz, (uint32_t)display_id, 1) < 0) {
             return EXIT_FAILURE;
         }
     }
@@ -518,30 +677,39 @@ int main() {
 
     sd_notifyf(0, "MAINPID=%lu", (unsigned long)getpid());
     sd_notify(0, "STATUS=Initializing create-disp…");
+
+    init_free_driver_slots_once();
+
+    // Wait up to 5s for evdi; then open
+    drm_fd = -1;
+    for (int i = 0; i < 5 * 1000; ++i) {
+        drm_fd = find_evdi_lindroid_device();
+        if (drm_fd >= 0)
+            break;
+        usleep(1000);
+    }
+    if (drm_fd < 0) drm_fd = open_evdi_lindroid_or_create();
+    if (drm_fd < 0) return EXIT_FAILURE;
+    drm_ready = true;
+
     hwcDevice = hwc2_compat_device_new(false);
     assert(hwcDevice);
-
     hwc2_compat_device_register_callback(hwcDevice, &eventListener,
                                          composerSequenceId);
 
-    for (int i = 0; i < 5 * 1000; ++i) {
-            /* Wait at most 5s for hotplug events */
-            if ((hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, 0)))
-                    break;
-            usleep(1000);
+    for (const auto& kv : g_hwc_to_drv) {
+        int drv_id = kv.second;
+        auto it = g_displays.find(drv_id);
+        if (it == g_displays.end())
+            continue;
+        Display& D = it->second;
+        if (!D.hwcDisplay) {
+            long long hwc_id = g_drv_to_hwc[drv_id];
+            D.hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, (hwc2_display_t)hwc_id);
+        }
+        if (D.hwcDisplay)
+            (void)update_display(drv_id);
     }
-    assert(hwcDisplay);
-
-    hwc2_compat_display_set_power_mode(hwcDisplay, HWC2_POWER_MODE_ON);
-
-    drm_fd = open_evdi_lindroid_or_create();
-    if (drm_fd < 0) {
-        return EXIT_FAILURE;
-    }
-
-    ret = update_display();
-    if(ret)
-        return ret;
 
     sd_notify(0, "READY=1");
     sd_notify(0, "STATUS=create-disp ready.");
