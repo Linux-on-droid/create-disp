@@ -10,11 +10,14 @@
 #include <memory>
 #include <cassert>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <vector>
+#include <new>
 #include <fstream>
 #include <cmath>
 #include <climits>
+#include <cstdint>
 #include <chrono>
 
 #include <systemd/sd-daemon.h>
@@ -69,6 +72,76 @@ static std::unordered_map<int, long long> g_drv_to_hwc;
 static std::vector<int> g_free_drv_ids;
 static volatile bool drm_ready = false;
 
+namespace {
+struct SmallBufPool {
+    static constexpr size_t kBuckets[5] = {256, 512, 1024, 2048, 4096};
+    std::vector<void*> free_[5];
+
+    void* alloc(size_t need) {
+        for (int i = 0; i < 5; ++i) {
+            if (need <= kBuckets[i]) {
+                if (!free_[i].empty()) {
+                    void* p = free_[i].back();
+                    free_[i].pop_back();
+                    return p;
+                }
+                return ::malloc(kBuckets[i]);
+            }
+        }
+        return ::malloc(need);
+    }
+    void dealloc(void* p, size_t had) {
+        if (!p) return;
+        for (int i = 0; i < 5; ++i) {
+            if (had <= kBuckets[i]) {
+                free_[i].push_back(p);
+                return;
+            }
+        }
+        ::free(p);
+    }
+    ~SmallBufPool() {
+        for (int i = 0; i < 5; ++i) {
+            for (void* p : free_[i]) ::free(p);
+            free_[i].clear();
+        }
+    }
+};
+static SmallBufPool g_small_pool;
+
+static inline uint64_t fnv1a64(const void* data, size_t len) {
+    const uint8_t* b = static_cast<const uint8_t*>(data);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+} // namespace
+
+namespace {
+struct RwbPool {
+    std::vector<void*> free_blocks;
+    void* acquire() {
+        if (!free_blocks.empty()) {
+            void* p = free_blocks.back();
+            free_blocks.pop_back();
+            return p;
+        }
+        return ::operator new(sizeof(RemoteWindowBuffer));
+    }
+    void release(void* p) { if (p) free_blocks.push_back(p); }
+    ~RwbPool() {
+        for (void* p : free_blocks) ::operator delete(p);
+        free_blocks.clear();
+    }
+};
+static RwbPool g_rwb_pool;
+struct RwbDeleter { void operator()(RemoteWindowBuffer* p) const { if (!p) return; p->~RemoteWindowBuffer(); g_rwb_pool.release(static_cast<void*>(p)); } };
+using UniqueRwb = std::unique_ptr<RemoteWindowBuffer, RwbDeleter>;
+} // namespace
+
 struct Display {
     int display_id = -1;
     int width = 0;
@@ -96,20 +169,28 @@ struct HandleInfo {
 
 int drm_fd;
 hwc2_compat_device_t* hwcDevice;
-static std::unordered_map<int, std::unique_ptr<RemoteWindowBuffer>> buffers_map;
+static std::unordered_map<int, UniqueRwb> buffers_map;
 static std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
-static std::unordered_map<std::string, int> handle_index;
-static inline std::string make_handle_key(const native_handle_t* h) {
-	const int total_ints = h->numInts;
-	const size_t key_bytes = (3 + total_ints) * sizeof(int);
-	std::string key(key_bytes, '\0');
-	size_t off = 0;
-	memcpy(&key[off], &h->version, sizeof(int)); off += sizeof(int);
-	memcpy(&key[off], &h->numFds, sizeof(int));  off += sizeof(int);
-	memcpy(&key[off], &h->numInts, sizeof(int)); off += sizeof(int);
-	memcpy(&key[off], &h->data[h->numFds], total_ints * sizeof(int));
-	return key;
+static std::unordered_map<uint64_t, std::vector<int>> handle_index;
+static std::unordered_map<int, uint64_t> handle_hash_by_id;
+static inline bool handles_equal(const native_handle_t* a, const native_handle_t* b) {
+    if (!a || !b) return false;
+    if (a->version != b->version) return false;
+    if (a->numFds  != b->numFds)  return false;
+    if (a->numInts != b->numInts) return false;
+    const int ints = a->numInts;
+    return std::memcmp(&a->data[a->numFds], &b->data[b->numFds], sizeof(int) * ints) == 0;
 }
+static inline uint64_t make_handle_hash(const native_handle_t* h) {
+    const int ints = h->numInts;
+    struct Hdr { int v, f, i; } hdr{h->version, h->numFds, h->numInts};
+    uint64_t h1 = fnv1a64(&hdr, sizeof(Hdr));
+    uint64_t h2 = fnv1a64(&h->data[h->numFds], sizeof(int) * ints);
+    /* Mix */
+    return (h1 ^ (h2 + 0x9e3779b97f4a7c15ull + (h1<<6) + (h1>>2)));
+}
+
+static constexpr size_t kExpectedHandles = 4096;
 int next_id = 0;
 enum poll_event_type {
     none,
@@ -181,7 +262,7 @@ struct drm_evdi_create_buff_callabck {
 };
 
 int add_handle(const native_handle_t& handle) {
-    size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
+    const size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
     native_handle_t* copied_handle = (native_handle_t*)malloc(total_size);
     if (!copied_handle) {
         printf("Memory allocation failed for handle copy\n");
@@ -427,12 +508,8 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
         printf("Invalid or closed file descriptor: %d\n", fd);
         return;
     }
-    if (lseek(fd, 0, SEEK_SET) == -1) {
-        printf("Failed to seek fd: %d\n", fd);
-        return;
-    }
     int header[3];
-    if (read(fd, header, sizeof(header)) != sizeof(header)) {
+    if (pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) {
         printf("Fd1 read failed fd: %d\n", fd);
         return;
     }
@@ -440,39 +517,47 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     int numFds = header[1];
     int numInts = header[2];
 
-    if (lseek(fd, 0, SEEK_SET) == -1) {
-        printf("Failed to seek fd: %d\n", fd);
-        return;
-    }
-    // Allocate memory for the full handle, including FDs and ints
-    size_t total_size = sizeof(buffer_handle_t) + 
-                        ((numFds + numInts) * sizeof(int));
-    native_handle_t *full_handle = (native_handle_t*)malloc(total_size);
+    size_t total_size = sizeof(buffer_handle_t) + ((size_t)numFds + (size_t)numInts) * sizeof(int);
+    void *blk = g_small_pool.alloc(total_size);
+    native_handle_t *full_handle = (native_handle_t*)blk;
     if (!full_handle) {
         printf("malloc failed size: %zu\n", total_size);
         return;
     }
-    if(read(fd, full_handle, total_size) != total_size) {
-        printf("Fd1 read failed fd: %d\n", fd);
-        return;
+    std::memcpy(full_handle, header, sizeof(header));
+    const size_t already = sizeof(header);
+    const size_t remain = (total_size > already) ? (total_size - already) : 0;
+    if (remain) {
+        if (pread(fd, (char*)full_handle + already, remain, (off_t)already) != (ssize_t)remain) {
+            g_small_pool.dealloc(blk, total_size);
+            printf("Fd read failed fd: %d", fd);
+            return;
+        }
     }
-
     {
-        const std::string key = make_handle_key(full_handle);
-        auto it = handle_index.find(key);
+        const uint64_t h = make_handle_hash(full_handle);
+        auto it = handle_index.find(h);
         if (it != handle_index.end()) {
-            printf("Identical buffer found, returning existing id: %d\n", it->second);
-            id = it->second;
-            free(full_handle);
+            for (int cand_id : it->second) {
+                native_handle_t *cand = get_handle(cand_id);
+                if (handles_equal(full_handle, cand)) {
+                    id = cand_id;
+                    break;
+                }
+            }
         }
         if (id == -1) {
             id = add_handle(*full_handle);
-            handle_index.emplace(key, id);
-            free(full_handle);
+            handle_hash_by_id[id] = h;
+            auto &vec = handle_index[h];
+            if (vec.empty()) vec.reserve(4);
+            vec.push_back(id);
         }
     }
 
-    close(fd);  
+    close(fd);
+    g_small_pool.dealloc(full_handle, total_size);
+
     struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
     ioctl(drm_fd, DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd);
 }
@@ -525,21 +610,24 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     {
         auto it_buf = buffers_map.find(id);
         if (it_buf == buffers_map.end()) {
-            auto new_buf = std::make_unique<RemoteWindowBuffer>(
+            void* mem = g_rwb_pool.acquire();
+            RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
                 D.width, D.height, D.stride,
                 HAL_PIXEL_FORMAT_RGBA_8888,
                 GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-            buf = new_buf.get();
-            buffers_map[id] = std::move(new_buf);
+            buffers_map[id] = UniqueRwb(rb);
+            buf = rb;
         } else {
             buf = it_buf->second.get();
-            if (buf->width != D.width || buf->height != D.height) {
-                auto new_buf = std::make_unique<RemoteWindowBuffer>(
+            if (buf->width != D.width || buf->height != D.height || buf->stride != D.stride) {
+                it_buf->second.reset();
+                void* mem = g_rwb_pool.acquire();
+                RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
                     D.width, D.height, D.stride,
                     HAL_PIXEL_FORMAT_RGBA_8888,
                     GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-                buf = new_buf.get();
-                buffers_map[id] = std::move(new_buf);
+                it_buf->second = UniqueRwb(rb);
+                buf = rb;
             }
         }
     }
@@ -569,6 +657,25 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         native_handle_t *handle = get_handle(id);
         if(handle) {
                 native_handle_close(handle);
+        }
+        auto it_hh = handle_hash_by_id.find(id);
+        if (it_hh != handle_hash_by_id.end()) {
+                const uint64_t hh = it_hh->second;
+                auto it_vec = handle_index.find(hh);
+                if (it_vec != handle_index.end()) {
+                        auto &vec = it_vec->second;
+                        for (size_t i = 0; i < vec.size(); ++i) {
+                                if (vec[i] == id) {
+                                        vec[i] = vec.back();
+                                        vec.pop_back();
+                                        break;
+                                }
+                        }
+                        if (vec.empty()) {
+                                handle_index.erase(it_vec);
+                        }
+                }
+                handle_hash_by_id.erase(it_hh);
         }
 	buffers_map.erase(id);
         handles_map.erase(id);
@@ -679,6 +786,14 @@ int main() {
     sd_notify(0, "STATUS=Initializing create-disp…");
 
     init_free_driver_slots_once();
+
+    handle_index.max_load_factor(0.5f);
+    handle_index.reserve(kExpectedHandles);
+    handles_map.reserve(kExpectedHandles);
+    buffers_map.reserve(kExpectedHandles);
+    g_displays.reserve(kMaxDriverDisplays);
+    g_hwc_to_drv.reserve(kMaxDriverDisplays);
+    g_drv_to_hwc.reserve(kMaxDriverDisplays);
 
     // Wait up to 5s for evdi; then open
     drm_fd = -1;
