@@ -19,6 +19,9 @@
 #include <climits>
 #include <cstdint>
 #include <chrono>
+#include <thread>
+#include <atomic>
+#include <csignal>
 
 #include <systemd/sd-daemon.h>
 
@@ -152,6 +155,10 @@ struct Display {
 };
 
 static std::unordered_map<int, Display> g_displays;
+
+// Poll thread
+static std::thread g_poll_thread;
+static std::atomic<bool> g_running{true};
 
 static inline Display& get_or_create_display(int display_id) {
     auto it = g_displays.find(display_id);
@@ -778,6 +785,60 @@ int update_display(int display_id) {
     return 0;
 }
 
+// Dedicated poll thread
+static void poll_thread_main()
+{
+    for (;;) {
+        if (!g_running.load(std::memory_order_acquire))
+            break;
+
+        drm_evdi_poll poll_cmd;
+        // Match EVDI_EVENT_PAYLOAD_MAX
+        uint8_t poll_payload[32];
+        poll_cmd.data = poll_payload;
+
+        int ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
+        if (ret)
+            continue;
+
+        switch (poll_cmd.event) {
+        case add_buf:
+            add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
+            break;
+        case get_buf:
+            get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
+            break;
+        case swap_to:
+            swap_to_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
+            break;
+        case destroy_buf:
+            destroy_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
+            break;
+        case create_buf:
+            create_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void handle_signal(int signo)
+{
+    (void)signo;
+    g_running.store(false, std::memory_order_release);
+}
+
+static void install_signal_handlers()
+{
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
 int main() {
     int device_index = 0;
     int composerSequenceId = 0;
@@ -809,6 +870,8 @@ int main() {
     drm_ready = true;
 
     hwcDevice = hwc2_compat_device_new(false);
+    if (!hwcDevice)
+        return EXIT_FAILURE;
     assert(hwcDevice);
     hwc2_compat_device_register_callback(hwcDevice, &eventListener,
                                          composerSequenceId);
@@ -827,38 +890,29 @@ int main() {
             (void)update_display(drv_id);
     }
 
+    install_signal_handlers();
+
     sd_notify(0, "READY=1");
     sd_notify(0, "STATUS=create-disp ready.");
 
-    drm_evdi_poll poll_cmd;
-    // Match loopback EVDI_EVENT_PAYLOAD_MAX
-    uint8_t poll_payload[32];
-    poll_cmd.data = poll_payload;
-
-    while (true) {
-        ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if(ret)
-            continue;
-        switch(poll_cmd.event) {
-           case add_buf:
-               add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-           case get_buf:
-               get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-           case swap_to:
-               swap_to_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-           case destroy_buf:
-               destroy_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-	   case create_buf:
-               create_buff(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-               break;
-        }
-	//uncomment for debugging
-	//printf("Got event: %d\n", poll_cmd.event);
+    // Start poll thread
+    try {
+        g_poll_thread = std::thread(poll_thread_main);
+    } catch (...) {
+        fprintf(stderr, "Failed to create poll thread\n");
+        close(drm_fd);
+        return EXIT_FAILURE;
     }
+
+     // Main thread loop.
+    while (g_running.load(std::memory_order_acquire)) {
+        pause();
+    }
+
+    // Shutdown
+    sd_notify(0, "STATUS=Stopping poll thread…");
+    if (g_poll_thread.joinable())
+        g_poll_thread.join();
 
     close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
