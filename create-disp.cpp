@@ -830,7 +830,9 @@ int main() {
     sd_notify(0, "STATUS=create-disp ready.");
 
     drm_evdi_poll poll_cmd;
-    poll_cmd.data = malloc(1024);
+    // Match loopback EVDI_EVENT_PAYLOAD_MAX
+    uint8_t poll_payload[32];
+    poll_cmd.data = poll_payload;
 
     while (true) {
         ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
@@ -857,7 +859,6 @@ int main() {
 	//printf("Got event: %d\n", poll_cmd.event);
     }
 
-    free(poll_cmd.data);
     close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
     return EXIT_SUCCESS;
