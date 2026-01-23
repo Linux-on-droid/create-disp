@@ -578,7 +578,6 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-    const native_handle_t* out_handle = NULL;
     struct { int id; int display_id; } ex = { -1, 0 };
     int ret;
     memcpy(&ex, data, sizeof(ex));
@@ -641,17 +640,19 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
 
-    int presentFence;
+    int presentFence = -1;
     error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
     if (error != HWC2_ERROR_NONE) {
         std::cerr << "Failed to present display: " << error << std::endl;
     }
+    if (presentFence >= 0)
+        close(presentFence);
+
     struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
     ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
-        const native_handle_t* out_handle = NULL;
         int id = *(int *)data;
         int ret;
         native_handle_t *handle = get_handle(id);
