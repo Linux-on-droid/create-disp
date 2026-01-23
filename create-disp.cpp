@@ -578,7 +578,6 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 }
 
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
-    const native_handle_t* out_handle = NULL;
     struct { int id; int display_id; } ex = { -1, 0 };
     int ret;
     memcpy(&ex, data, sizeof(ex));
@@ -641,17 +640,19 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
 
-    int presentFence;
+    int presentFence = -1;
     error = hwc2_compat_display_present(D.hwcDisplay, &presentFence);
     if (error != HWC2_ERROR_NONE) {
         std::cerr << "Failed to present display: " << error << std::endl;
     }
+    if (presentFence >= 0)
+        close(presentFence);
+
     struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
     ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
-        const native_handle_t* out_handle = NULL;
         int id = *(int *)data;
         int ret;
         native_handle_t *handle = get_handle(id);
@@ -830,7 +831,9 @@ int main() {
     sd_notify(0, "STATUS=create-disp ready.");
 
     drm_evdi_poll poll_cmd;
-    poll_cmd.data = malloc(1024);
+    // Match loopback EVDI_EVENT_PAYLOAD_MAX
+    uint8_t poll_payload[32];
+    poll_cmd.data = poll_payload;
 
     while (true) {
         ret = ioctl(drm_fd, DRM_IOCTL_EVDI_POLL, &poll_cmd);
@@ -857,7 +860,6 @@ int main() {
 	//printf("Got event: %d\n", poll_cmd.event);
     }
 
-    free(poll_cmd.data);
     close(drm_fd);
     sd_notify(0, "STATUS=Shutting down…");
     return EXIT_SUCCESS;
