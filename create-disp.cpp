@@ -587,6 +587,9 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
 void swap_to_buff(void *data, int poll_id, int drm_fd) {
     struct { int id; int display_id; } ex = { -1, 0 };
     int ret;
+    uint32_t numTypes = 0;
+    uint32_t numRequests = 0;
+    hwc2_error_t error = HWC2_ERROR_NONE;
     memcpy(&ex, data, sizeof(ex));
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
@@ -607,6 +610,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
         return;
     }
+    
     if (g_drv_to_hwc.find(drv_display_id) == g_drv_to_hwc.end()) {
         struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
         ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
@@ -637,12 +641,30 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
             }
         }
     }
-    hwc2_error_t error;
+
+    error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
+    if (error != HWC2_ERROR_NONE && error != HWC2_ERROR_HAS_CHANGES) {
+        std::cerr << "prepare: validate failed for display " << D.hwcDisplay << error << std::endl;
+        return;
+    }
+
+    if (numTypes || numRequests) {
+        std::cerr << "prepare: validate required changes for display " << error << std::endl;
+        return;
+    }
+
+    error = hwc2_compat_display_accept_changes(D.hwcDisplay);
+    if (error != HWC2_ERROR_NONE) {
+        std::cerr << "prepare: acceptChanges failed: " << error << std::endl;
+        return;
+    }
+
     if (buf->width > D.width || buf->height > D.height) {
         struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
         ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
         return;
     }
+
     hwc2_compat_display_set_client_target(D.hwcDisplay, /* slot */0, buf,
                                               -1,
                                               HAL_DATASPACE_UNKNOWN);
