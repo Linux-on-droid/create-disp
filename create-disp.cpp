@@ -29,6 +29,7 @@
 #include <hybris/gralloc/gralloc.h>
 #include <hybris/platforms/common/windowbuffer.h>
 
+struct drm_evdi_swap_callback;
 #define DRM_EVDI_CONNECT          0x00
 #define DRM_EVDI_REQUEST_UPDATE   0x01
 #define DRM_EVDI_GRABPIX          0x02
@@ -160,6 +161,16 @@ static std::unordered_map<int, Display> g_displays;
 static std::thread g_poll_thread;
 static std::atomic<bool> g_running{true};
 
+#ifndef likely
+#define likely(x)	__builtin_expect(!!(x), 1)
+#define unlikely(x)	__builtin_expect(!!(x), 0)
+#endif
+
+static constexpr int kRwbUsage =
+	GRALLOC_USAGE_HW_TEXTURE |
+	GRALLOC_USAGE_HW_RENDER |
+	GRALLOC_USAGE_HW_COMPOSER;
+
 static inline Display& get_or_create_display(int display_id) {
     auto it = g_displays.find(display_id);
     if (it != g_displays.end()) return it->second;
@@ -267,6 +278,12 @@ struct drm_evdi_create_buff_callabck {
 	int id;
 	uint32_t stride;
 };
+
+static inline void evdi_swap_ack(int poll_id, int drm_fd)
+{
+	struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
+	ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+}
 
 int add_handle(const native_handle_t& handle) {
     const size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
@@ -481,7 +498,10 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
             if (drv_id < 0) return;
             Display& D = get_or_create_display(drv_id);
             evdi_connect(drm_fd, 0, 0, 0, 0, (uint32_t)drv_id, 0);
-            if (D.layer) D.layer = nullptr;
+            if (D.layer && D.hwcDisplay)
+                hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
+            D.layer = nullptr;
+            D.hwcDisplay = nullptr;
             D.width = D.height = 0;
             D.stride = 0;
             release_driver_slot_for_hwc(hwc_id);
@@ -596,7 +616,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     buffer_handle_t in_handle = get_handle(id);
     RemoteWindowBuffer *buf = nullptr;
-    if (in_handle == nullptr) {
+    if (unlikely(in_handle == nullptr)) {
         printf("Failed to find buf: %d\n", id);
         struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
         ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
@@ -604,42 +624,29 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     }
 
     Display& D = get_or_create_display(drv_display_id);
-    if (!D.hwcDisplay || D.width == 0 || D.height == 0) {
+    if (unlikely(!D.hwcDisplay || D.width == 0 || D.height == 0)) {
         printf("Display %d not ready (no HWC or size)\n", drv_display_id);
-        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
-        return;
-    }
-    
-    if (g_drv_to_hwc.find(drv_display_id) == g_drv_to_hwc.end()) {
-        struct drm_evdi_swap_callback cmd = {.poll_id = poll_id};
-        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        evdi_swap_ack(poll_id, drm_fd);
         return;
     }
 
-    {
-        auto it_buf = buffers_map.find(id);
-        if (it_buf == buffers_map.end()) {
-            void* mem = g_rwb_pool.acquire();
-            RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
-                D.width, D.height, D.stride,
-                HAL_PIXEL_FORMAT_RGBA_8888,
-                GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-            buffers_map[id] = UniqueRwb(rb);
-            buf = rb;
-        } else {
-            buf = it_buf->second.get();
-            if (buf->width != D.width || buf->height != D.height || buf->stride != D.stride) {
-                it_buf->second.reset();
-                void* mem = g_rwb_pool.acquire();
-                RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
-                    D.width, D.height, D.stride,
-                    HAL_PIXEL_FORMAT_RGBA_8888,
-                    GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, in_handle);
-                it_buf->second = UniqueRwb(rb);
-                buf = rb;
-            }
-        }
+    auto it_buf = buffers_map.find(id);
+    if (it_buf == buffers_map.end()) {
+        void* mem = g_rwb_pool.acquire();
+        RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
+            D.width, D.height, D.stride,
+            HAL_PIXEL_FORMAT_RGBA_8888,
+            kRwbUsage, in_handle);
+        it_buf = buffers_map.emplace(id, UniqueRwb(rb)).first;
+    }
+
+    buf = it_buf->second.get();
+    if (unlikely(buf->width != D.width || buf->height != D.height || buf->stride != D.stride)) {
+        buf->~RemoteWindowBuffer();
+        new (buf) RemoteWindowBuffer(
+            D.width, D.height, D.stride,
+            HAL_PIXEL_FORMAT_RGBA_8888,
+            kRwbUsage, in_handle);
     }
 
     error = hwc2_compat_display_validate(D.hwcDisplay, &numTypes, &numRequests);
@@ -660,8 +667,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     }
 
     if (buf->width > D.width || buf->height > D.height) {
-        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+        evdi_swap_ack(poll_id, drm_fd);
         return;
     }
 
@@ -677,8 +683,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     if (presentFence >= 0)
         close(presentFence);
 
-    struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-    ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
+    evdi_swap_ack(poll_id, drm_fd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
