@@ -209,7 +209,8 @@ static inline uint64_t make_handle_hash(const native_handle_t* h) {
 }
 
 static constexpr size_t kExpectedHandles = 4096;
-int next_id = 0;
+/* buffer ids must be > 0 to not break PRIME export */
+int next_id = 1;
 enum poll_event_type {
     none,
     add_buf,
@@ -293,6 +294,9 @@ int add_handle(const native_handle_t& handle) {
         return -1;
     }
     memcpy(copied_handle, &handle, total_size);
+
+    if (next_id <= 0)
+        next_id = 1;
 
     int id = next_id++;
     handles_map[id] = std::unique_ptr<native_handle_t>(copied_handle);
