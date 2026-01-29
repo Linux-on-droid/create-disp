@@ -618,19 +618,22 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
 
+    struct SwapAckGuard {
+        int poll_id;
+        int drm_fd;
+        ~SwapAckGuard() { evdi_swap_ack(poll_id, drm_fd); }
+    } ack{poll_id, drm_fd};
+
     buffer_handle_t in_handle = get_handle(id);
     RemoteWindowBuffer *buf = nullptr;
     if (unlikely(in_handle == nullptr)) {
         printf("Failed to find buf: %d\n", id);
-        struct drm_evdi_swap_callback cmd = {.poll_id=poll_id};
-        ioctl(drm_fd, DRM_IOCTL_EVDI_SWAP_CALLBACK, &cmd);
         return;
     }
 
     Display& D = get_or_create_display(drv_display_id);
     if (unlikely(!D.hwcDisplay || D.width == 0 || D.height == 0)) {
         printf("Display %d not ready (no HWC or size)\n", drv_display_id);
-        evdi_swap_ack(poll_id, drm_fd);
         return;
     }
 
@@ -686,8 +689,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     }
     if (presentFence >= 0)
         close(presentFence);
-
-    evdi_swap_ack(poll_id, drm_fd);
 }
 
 void destroy_buff(void *data, int poll_id, int drm_fd) {
