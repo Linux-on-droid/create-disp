@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstdint>
 #include <set>
+#include <deque>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -85,7 +86,13 @@ static constexpr uint32_t kHwcMaxSlots = 64;
 static constexpr uint32_t kSlotsPerDisplay = kHwcMaxSlots / uint32_t(kMaxDriverDisplays);
 static_assert(kSlotsPerDisplay >= 4, "Need at least 4 slots per display");
 static_assert(kSlotsPerDisplay * uint32_t(kMaxDriverDisplays) <= kHwcMaxSlots, "Slot partition overflow");
-static uint32_t g_slot_cursor[kMaxDriverDisplays] = {};
+static inline uint32_t slot_for_buffer(int display_id, int buf_id)
+{
+    if (display_id < 0 || display_id >= kMaxDriverDisplays) return 0;
+    const uint32_t base = uint32_t(display_id) * kSlotsPerDisplay;
+    const uint32_t idx  = uint32_t(uint32_t(buf_id) % kSlotsPerDisplay);
+    return base + idx;
+}
 
 static std::mutex g_state_mutex;
 
@@ -93,8 +100,10 @@ static std::mutex g_drm_mutex;
 
 static std::mutex g_update_mutex;
 static std::condition_variable g_update_cv;
-static std::set<int> g_pending_updates;
-static std::set<int> g_pending_disconnects;
+static std::deque<int> g_work_queue;
+static bool g_pending_update[kMaxDriverDisplays] = {};
+static bool g_pending_disconnect[kMaxDriverDisplays] = {};
+static bool g_enqueued[kMaxDriverDisplays] = {};
 static std::thread g_update_thread;
 
 static std::atomic<bool> g_reopen_requested{false};
@@ -128,8 +137,13 @@ static inline void schedule_update(int drv_display_id)
 {
     {
         std::lock_guard<std::mutex> lk(g_update_mutex);
-        if (drv_display_id >= 0 && drv_display_id < kMaxDriverDisplays)
-            g_pending_updates.insert(drv_display_id);
+        if (drv_display_id >= 0 && drv_display_id < kMaxDriverDisplays) {
+            g_pending_update[drv_display_id] = true;
+            if (!g_enqueued[drv_display_id]) {
+                g_work_queue.push_back(drv_display_id);
+                g_enqueued[drv_display_id] = true;
+            }
+        }
     }
     g_update_cv.notify_one();
 }
@@ -139,20 +153,15 @@ static inline void schedule_disconnect(int drv_display_id)
     {
         std::lock_guard<std::mutex> lk(g_update_mutex);
         if (drv_display_id >= 0 && drv_display_id < kMaxDriverDisplays) {
-            g_pending_disconnects.insert(drv_display_id);
-            g_pending_updates.erase(drv_display_id);
+            g_pending_disconnect[drv_display_id] = true;
+            g_pending_update[drv_display_id] = false;
+            if (!g_enqueued[drv_display_id]) {
+                g_work_queue.push_back(drv_display_id);
+                g_enqueued[drv_display_id] = true;
+            }
         }
     }
     g_update_cv.notify_one();
-}
-
-static inline uint32_t slot_for_display_locked(int display_id)
-{
-    if (display_id < 0 || display_id >= kMaxDriverDisplays)
-        return 0;
-    const uint32_t base = uint32_t(display_id) * kSlotsPerDisplay;
-    const uint32_t idx  = (g_slot_cursor[display_id]++) % kSlotsPerDisplay;
-    return base + idx;
 }
 
 namespace {
@@ -174,11 +183,21 @@ struct RwbPool {
 };
 static RwbPool g_rwb_pool;
 struct RwbDeleter { void operator()(RemoteWindowBuffer* p) const { if (!p) return; p->~RemoteWindowBuffer(); g_rwb_pool.release(static_cast<void*>(p)); } };
-using UniqueRwb = std::unique_ptr<RemoteWindowBuffer, RwbDeleter>;
+using SharedRwb = std::shared_ptr<RemoteWindowBuffer>;
+
+static inline SharedRwb make_rwb(int w, int h, uint32_t stride,
+                                 int format, int usage,
+                                 buffer_handle_t handle)
+{
+    void* mem = g_rwb_pool.acquire();
+    RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(w, h, stride, format, usage, handle);
+    return SharedRwb(rb, RwbDeleter{});
+}
 } // namespace
 
 struct Display {
     int display_id = -1;
+    long long hwc_id = 0;
     int width = 0;
     int height = 0;
     uint32_t stride = 0;
@@ -212,11 +231,6 @@ static inline Display& get_or_create_display(int display_id) {
     return g_displays[display_id];
 }
 
-struct HandleInfo {
-    std::unique_ptr<native_handle_t> handle;
-    int id;
-};
-
 int drm_fd;
 hwc2_compat_device_t* hwcDevice;
 
@@ -227,20 +241,32 @@ struct HandleFreeDeleter {
 };
 using UniqueHandle = std::unique_ptr<native_handle_t, HandleFreeDeleter>;
 
+enum class BufferOrigin : uint8_t {
+    Imported = 0,
+    Allocated = 1,
+};
+
 struct BufferEntry {
+    BufferOrigin origin = BufferOrigin::Imported;
     UniqueHandle handle;
     // created first swap_to:
-    UniqueRwb rwb;
-};
-static std::unordered_map<int, BufferEntry> g_buffers;
+    SharedRwb rwb;
+    // Track geometry used to build rwb so we can detect mismatch
+    int rwb_w = 0;
+    int rwb_h = 0;
+    uint32_t rwb_stride = 0;
 
-static inline RemoteWindowBuffer* alloc_rwb(int w, int h, uint32_t stride,
-                                           int format, int usage,
-                                           buffer_handle_t handle)
-{
-    void* mem = g_rwb_pool.acquire();
-    return new (mem) RemoteWindowBuffer(w, h, stride, format, usage, handle);
-}
+    ~BufferEntry() {
+        if (!handle) return;
+        if (origin == BufferOrigin::Allocated) {
+            (void)hybris_gralloc_release((buffer_handle_t)handle.get(), /*was_allocated=*/1);
+        } else {
+            native_handle_close(handle.get());
+        }
+    }
+};
+
+static std::unordered_map<int, std::shared_ptr<BufferEntry>> g_buffers;
 
 static constexpr size_t kExpectedHandles = 4096;
 /* buffer ids must be > 0 to not break PRIME export */
@@ -326,7 +352,7 @@ static inline int evdi_swap_reply(int poll_id)
     return rc;
 }
 
-int add_handle(const native_handle_t& handle)
+int add_handle(const native_handle_t& handle, BufferOrigin origin)
 {
     const size_t total_size =
         sizeof(native_handle_t) + (size_t(handle.numFds) + size_t(handle.numInts)) * sizeof(int);
@@ -343,16 +369,17 @@ int add_handle(const native_handle_t& handle)
         next_id = 1;
 
     int id = next_id++;
-    BufferEntry &e = g_buffers[id];
-    e.handle.reset(copied_handle);
-    e.rwb.reset();
+    auto e = std::make_shared<BufferEntry>();
+    e->origin = origin;
+    e->handle.reset(copied_handle);
+    g_buffers[id] = std::move(e);
     return id;
 }
 
-static inline BufferEntry* get_entry_locked_nolock(int id)
+static inline std::shared_ptr<BufferEntry> get_entry_locked_nolock(int id)
 {
     auto it = g_buffers.find(id);
-    return (it != g_buffers.end()) ? &it->second : nullptr;
+    return (it != g_buffers.end()) ? it->second : nullptr;
 }
 
 static inline void init_free_driver_slots_once() {
@@ -361,19 +388,6 @@ static inline void init_free_driver_slots_once() {
     for (int i = kMaxDriverDisplays - 1; i >= 0; --i) {
         g_free_drv_ids.push_back(i);
     }
-}
-
-static int drm_auth_magic(int fd, drm_magic_t magic) {
-    drm_auth_t auth{};
-    auth.magic = magic;
-    if (ioctl(fd, DRM_IOCTL_AUTH_MAGIC, &auth)) {
-        return -errno;
-    }
-    return 0;
-}
-
-static bool drm_is_master(int fd) {
-    return drm_auth_magic(fd, 0) != -EACCES;
 }
 
 bool is_evdi_lindroid(int fd) {
@@ -537,6 +551,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
                 }
                 Display& D = get_or_create_display(drv_id);
                 D.display_id = drv_id;
+                D.hwc_id = hwc_id;
                 D.hwcDisplay = hwc2_compat_device_get_display_by_id(hwcDevice, display);
                 D.connected = true;
             }
@@ -622,7 +637,7 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     }
 
     // always assign a new id per incoming handle.
-    const int id = add_handle(*full_handle);
+    const int id = add_handle(*full_handle, BufferOrigin::Imported);
 
     ::free(full_handle);
     close(fd);
@@ -646,7 +661,7 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     native_handle_t* handle = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        BufferEntry* E = get_entry_locked_nolock(id);
+        std::shared_ptr<BufferEntry> E = get_entry_locked_nolock(id);
         handle = (E && E->handle) ? E->handle.get() : nullptr;
     }
 
@@ -687,55 +702,56 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     hwc2_compat_display_t* hwcDisp = nullptr;
     Display Dsnap;
-    native_handle_t* in_handle = nullptr;
-    RemoteWindowBuffer* buf = nullptr;
+    std::shared_ptr<BufferEntry> entry;
+    SharedRwb rwb;
     uint32_t slot = 0;
 
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        BufferEntry *E = get_entry_locked_nolock(id);
-        in_handle = (E && E->handle) ? E->handle.get() : nullptr;
-        if (unlikely(in_handle == nullptr)) {
+        entry = get_entry_locked_nolock(id);
+        if (!entry || !entry->handle) {
             printf("Failed to find buf: %d\n", id);
             return;
         }
         Display& D = get_or_create_display(drv_display_id);
         Dsnap = D;
         hwcDisp = D.hwcDisplay;
-        slot = slot_for_display_locked(drv_display_id);
-
-        if (!hwcDisp || D.width == 0 || D.height == 0 || D.stride == 0) {
-            return;
-        }
-        if (E) {
-            if (!E->rwb) {
-                E->rwb.reset(alloc_rwb(D.width, D.height, D.stride,
-                                      HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage, in_handle));
-            } else {
-                RemoteWindowBuffer *cur = E->rwb.get();
-                if (cur->width != D.width || cur->height != D.height || cur->stride != D.stride) {
-                    E->rwb.reset();
-                    E->rwb.reset(alloc_rwb(D.width, D.height, D.stride,
-                                          HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage, in_handle));
-                }
-            }
-            buf = E->rwb.get();
-        }
     }
 
-    if (unlikely(!hwcDisp || Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0 || !buf)) {
+    if (unlikely(!hwcDisp || Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0)) {
         printf("Display %d not ready (no HWC or size)\n", drv_display_id);
+        return;
+    }
+
+    slot = slot_for_buffer(drv_display_id, id);
+
+    // Check RWB matches display geometry
+    {
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+        if (!entry->rwb ||
+            entry->rwb_w != Dsnap.width || entry->rwb_h != Dsnap.height || entry->rwb_stride != Dsnap.stride) {
+            entry->rwb = make_rwb(Dsnap.width, Dsnap.height, Dsnap.stride,
+                                  HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage,
+                                  entry->handle.get());
+            entry->rwb_w = Dsnap.width;
+            entry->rwb_h = Dsnap.height;
+            entry->rwb_stride = Dsnap.stride;
+        }
+        rwb = entry->rwb;
+    }
+
+    if (unlikely(!rwb)) {
+        printf("Failed to allocate RemoteWindowBuffer for id=%d\n", id);
         return;
     }
 
     error = hwc2_compat_display_set_client_target(hwcDisp,
                                                  slot,
-                                                 buf,
+                                                 rwb.get(),
                                                  -1,
                                                  HAL_DATASPACE_UNKNOWN);
     if (error != HWC2_ERROR_NONE) {
         fprintf(stderr, "set_client_target failed: %d\n", (int)error);
-        //return;
     }
 
     error = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
@@ -761,10 +777,6 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         int ret;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
-            BufferEntry *E = get_entry_locked_nolock(id);
-            if (E && E->handle) {
-                native_handle_close(E->handle.get());
-            }
             g_buffers.erase(id);
         }
 
@@ -781,11 +793,18 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     struct drm_evdi_create_buff_callabck cmd;
     memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
     const native_handle_t *full_handle;
-    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888, GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER, &full_handle, &cmd.stride);
+    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888,
+                                      GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
+                                      (buffer_handle_t*)&full_handle, &cmd.stride);
     if (ret != 0) {
         fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
+        cmd.id = -1;
+        cmd.poll_id = poll_id;
+        cmd.stride = 0;
+        (void)drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
+        return;
     }
-    cmd.id = add_handle(*full_handle);
+    cmd.id = add_handle(*full_handle, BufferOrigin::Allocated);
     cmd.poll_id = poll_id;
     drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
@@ -835,10 +854,9 @@ int update_display(int display_id) {
             return 0;
 
         for (auto &kv : g_buffers) {
-            kv.second.rwb.reset();
+            if (kv.second)
+                kv.second->rwb.reset();
         }
-        if (display_id >= 0 && display_id < kMaxDriverDisplays)
-            g_slot_cursor[display_id] = 0;
         D.width = config->width;
         D.height = config->height;
         D.stride = 0;
@@ -858,9 +876,13 @@ int update_display(int display_id) {
         }
     }
     buffer_handle_t handle = NULL;
-    hybris_gralloc_allocate(config->width, config->height, HAL_PIXEL_FORMAT_RGBA_8888,
-                            GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
-                            &handle, &Dsnap.stride);
+    int r = hybris_gralloc_allocate(config->width, config->height, HAL_PIXEL_FORMAT_RGBA_8888,
+                                   GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
+                                   &handle, &Dsnap.stride);
+    if (r == 0 && handle) {
+        // Free immediately since this was only used to determine stride
+        (void)hybris_gralloc_release(handle, /*was_allocated=*/1);
+    }
 
     int refresh_hz = get_refresh_hz_from_active_config(config);
 
@@ -897,6 +919,7 @@ static void disconnect_display(int drv_id)
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         Display& D = get_or_create_display(drv_id);
+        const long long hwc_id = D.hwc_id;
         if (D.layer && D.hwcDisplay)
             hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
         D.layer = nullptr;
@@ -904,8 +927,9 @@ static void disconnect_display(int drv_id)
         D.width = D.height = 0;
         D.stride = 0;
         D.connected = false;
-        if (drv_id >= 0 && drv_id < kMaxDriverDisplays)
-            g_slot_cursor[drv_id] = 0;
+        D.hwc_id = 0;
+        if (hwc_id != 0)
+            release_driver_slot_for_hwc(hwc_id);
     }
 }
 
@@ -913,36 +937,48 @@ static void update_thread_main()
 {
     for (;;) {
         int disp = -1;
-        bool do_disconnect = false;
 
         {
             std::unique_lock<std::mutex> lk(g_update_mutex);
             g_update_cv.wait(lk, []{
                 extern std::atomic<bool> g_running;
                 return !g_running.load(std::memory_order_acquire) ||
-                       !g_pending_disconnects.empty() ||
-                       !g_pending_updates.empty();
+                       !g_work_queue.empty();
             });
 
             extern std::atomic<bool> g_running;
             if (!g_running.load(std::memory_order_acquire))
                 break;
 
-            if (!g_pending_disconnects.empty()) {
-                disp = *g_pending_disconnects.begin();
-                g_pending_disconnects.erase(g_pending_disconnects.begin());
-                do_disconnect = true;
-            } else if (!g_pending_updates.empty()) {
-                disp = *g_pending_updates.begin();
-                g_pending_updates.erase(g_pending_updates.begin());
-            }
+            if (g_work_queue.empty())
+                continue;
+            disp = g_work_queue.front();
+            g_work_queue.pop_front();
+            if (disp >= 0 && disp < kMaxDriverDisplays)
+                g_enqueued[disp] = false;
         }
 
         if (disp < 0)
             continue;
+
+        bool do_disconnect = false;
+        bool do_update = false;
+        {
+            std::lock_guard<std::mutex> lk(g_update_mutex);
+            if (disp >= 0 && disp < kMaxDriverDisplays) {
+                if (g_pending_disconnect[disp]) {
+                    g_pending_disconnect[disp] = false;
+                    do_disconnect = true;
+                } else if (g_pending_update[disp]) {
+                    g_pending_update[disp] = false;
+                    do_update = true;
+                }
+            }
+        }
+
         if (do_disconnect)
             disconnect_display(disp);
-        else
+        else if (do_update)
             (void)update_display(disp);
     }
 }
@@ -980,8 +1016,6 @@ static void poll_thread_main()
                         kv.second.width = 0;
                         kv.second.height = 0;
                         kv.second.stride = 0;
-                        if (kv.first >= 0 && kv.first < kMaxDriverDisplays)
-                            g_slot_cursor[kv.first] = 0;
                         schedule_update(kv.first);
                     }
                 }
@@ -1044,7 +1078,6 @@ static void install_signal_handlers()
 int main() {
     int device_index = 0;
     int composerSequenceId = 0;
-    int ret =0;
 
     sd_notifyf(0, "MAINPID=%lu", (unsigned long)getpid());
     sd_notify(0, "STATUS=Initializing create-disp…");
