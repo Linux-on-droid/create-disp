@@ -322,14 +322,14 @@ static inline bool handles_equal(const native_handle_t* a, const native_handle_t
     if (a->version != b->version) return false;
     if (a->numFds  != b->numFds)  return false;
     if (a->numInts != b->numInts) return false;
-    const int ints = a->numInts;
-    return std::memcmp(&a->data[a->numFds], &b->data[b->numFds], sizeof(int) * ints) == 0;
+    const int n = a->numFds + a->numInts;
+    return std::memcmp(a->data, b->data, sizeof(int) * n) == 0;
 }
 static inline uint64_t make_handle_hash(const native_handle_t* h) {
-    const int ints = h->numInts;
+    const int n = h->numFds + h->numInts;
     struct Hdr { int v, f, i; } hdr{h->version, h->numFds, h->numInts};
     uint64_t h1 = fnv1a64(&hdr, sizeof(Hdr));
-    uint64_t h2 = fnv1a64(&h->data[h->numFds], sizeof(int) * ints);
+    uint64_t h2 = fnv1a64(h->data, sizeof(int) * n);
     /* Mix */
     return (h1 ^ (h2 + 0x9e3779b97f4a7c15ull + (h1<<6) + (h1>>2)));
 }
