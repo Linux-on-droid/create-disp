@@ -11,7 +11,6 @@
 #include <memory>
 #include <cassert>
 #include <unordered_map>
-#include <unordered_set>
 #include <map>
 #include <vector>
 #include <new>
@@ -83,8 +82,10 @@ static std::atomic<bool> drm_ready{false};
 
 static constexpr uint32_t kHwcMaxSlots = 64;
 
-static std::unordered_map<uint64_t, uint32_t> g_slot_by_key;      // key=(display<<32)|buf_id
-static std::unordered_map<int, uint32_t> g_next_slot_by_display;  // display_id -> next slot
+static constexpr uint32_t kSlotsPerDisplay = kHwcMaxSlots / uint32_t(kMaxDriverDisplays);
+static_assert(kSlotsPerDisplay >= 4, "Need at least 4 slots per display");
+static_assert(kSlotsPerDisplay * uint32_t(kMaxDriverDisplays) <= kHwcMaxSlots, "Slot partition overflow");
+static uint32_t g_slot_cursor[kMaxDriverDisplays] = {};
 
 static std::mutex g_state_mutex;
 
@@ -145,109 +146,14 @@ static inline void schedule_disconnect(int drv_display_id)
     g_update_cv.notify_one();
 }
 
-static inline uint32_t slot_for_buffer_locked(int display_id, int buf_id)
+static inline uint32_t slot_for_display_locked(int display_id)
 {
-    const uint64_t key = (uint64_t(uint32_t(display_id)) << 32) | uint32_t(buf_id);
-    auto it = g_slot_by_key.find(key);
-    if (it != g_slot_by_key.end())
-        return it->second;
-
-    uint32_t &next = g_next_slot_by_display[display_id];
-    uint32_t slot = next % kHwcMaxSlots;
-    next++;
-    g_slot_by_key.emplace(key, slot);
-    return slot;
+    if (display_id < 0 || display_id >= kMaxDriverDisplays)
+        return 0;
+    const uint32_t base = uint32_t(display_id) * kSlotsPerDisplay;
+    const uint32_t idx  = (g_slot_cursor[display_id]++) % kSlotsPerDisplay;
+    return base + idx;
 }
-
-static inline void reset_slots_for_display_locked(int display_id)
-{
-    for (auto it = g_slot_by_key.begin(); it != g_slot_by_key.end(); ) {
-        const uint32_t disp = uint32_t(it->first >> 32);
-        if ((int)disp == display_id) it = g_slot_by_key.erase(it);
-        else ++it;
-    }
-    g_next_slot_by_display.erase(display_id);
-}
-
-static inline void erase_slots_for_id_locked(int buf_id)
-{
-    for (auto it = g_slot_by_key.begin(); it != g_slot_by_key.end(); ) {
-        const uint32_t id = uint32_t(it->first & 0xffffffffu);
-        if ((int)id == buf_id) it = g_slot_by_key.erase(it);
-        else ++it;
-    }
-}
-
-static inline uint64_t slot_key_for(int display_id, int buf_id)
-{
-    return (uint64_t(uint32_t(display_id)) << 32) | uint32_t(buf_id);
-}
-
-static inline uint32_t slot_for_buffer(int display_id, int buf_id)
-{
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    return slot_for_buffer_locked(display_id, buf_id);
-}
-
-static inline void reset_slots_for_display(int display_id)
-{
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    reset_slots_for_display_locked(display_id);
-}
-
-static inline void erase_slots_for_id(int buf_id)
-{
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    erase_slots_for_id_locked(buf_id);
-}
-
-namespace {
-struct SmallBufPool {
-    static constexpr size_t kBuckets[5] = {256, 512, 1024, 2048, 4096};
-    std::vector<void*> free_[5];
-
-    void* alloc(size_t need) {
-        for (int i = 0; i < 5; ++i) {
-            if (need <= kBuckets[i]) {
-                if (!free_[i].empty()) {
-                    void* p = free_[i].back();
-                    free_[i].pop_back();
-                    return p;
-                }
-                return ::malloc(kBuckets[i]);
-            }
-        }
-        return ::malloc(need);
-    }
-    void dealloc(void* p, size_t had) {
-        if (!p) return;
-        for (int i = 0; i < 5; ++i) {
-            if (had <= kBuckets[i]) {
-                free_[i].push_back(p);
-                return;
-            }
-        }
-        ::free(p);
-    }
-    ~SmallBufPool() {
-        for (int i = 0; i < 5; ++i) {
-            for (void* p : free_[i]) ::free(p);
-            free_[i].clear();
-        }
-    }
-};
-static SmallBufPool g_small_pool;
-
-static inline uint64_t fnv1a64(const void* data, size_t len) {
-    const uint8_t* b = static_cast<const uint8_t*>(data);
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= b[i];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-} // namespace
 
 namespace {
 struct RwbPool {
@@ -313,25 +219,27 @@ struct HandleInfo {
 
 int drm_fd;
 hwc2_compat_device_t* hwcDevice;
-static std::unordered_map<int, UniqueRwb> buffers_map;
-static std::unordered_map<int, std::unique_ptr<native_handle_t>> handles_map;
-static std::unordered_map<uint64_t, std::vector<int>> handle_index;
-static std::unordered_map<int, uint64_t> handle_hash_by_id;
-static inline bool handles_equal(const native_handle_t* a, const native_handle_t* b) {
-    if (!a || !b) return false;
-    if (a->version != b->version) return false;
-    if (a->numFds  != b->numFds)  return false;
-    if (a->numInts != b->numInts) return false;
-    const int n = a->numFds + a->numInts;
-    return std::memcmp(a->data, b->data, sizeof(int) * n) == 0;
-}
-static inline uint64_t make_handle_hash(const native_handle_t* h) {
-    const int n = h->numFds + h->numInts;
-    struct Hdr { int v, f, i; } hdr{h->version, h->numFds, h->numInts};
-    uint64_t h1 = fnv1a64(&hdr, sizeof(Hdr));
-    uint64_t h2 = fnv1a64(h->data, sizeof(int) * n);
-    /* Mix */
-    return (h1 ^ (h2 + 0x9e3779b97f4a7c15ull + (h1<<6) + (h1>>2)));
+
+struct HandleFreeDeleter {
+    void operator()(native_handle_t* h) const {
+        if (h) ::free(h);
+    }
+};
+using UniqueHandle = std::unique_ptr<native_handle_t, HandleFreeDeleter>;
+
+struct BufferEntry {
+    UniqueHandle handle;
+    // created first swap_to:
+    UniqueRwb rwb;
+};
+static std::unordered_map<int, BufferEntry> g_buffers;
+
+static inline RemoteWindowBuffer* alloc_rwb(int w, int h, uint32_t stride,
+                                           int format, int usage,
+                                           buffer_handle_t handle)
+{
+    void* mem = g_rwb_pool.acquire();
+    return new (mem) RemoteWindowBuffer(w, h, stride, format, usage, handle);
 }
 
 static constexpr size_t kExpectedHandles = 4096;
@@ -418,9 +326,11 @@ static inline int evdi_swap_reply(int poll_id)
     return rc;
 }
 
-int add_handle(const native_handle_t& handle) {
-    const size_t total_size = sizeof(native_handle_t) + (handle.numFds + handle.numInts) * sizeof(int);
-    native_handle_t* copied_handle = (native_handle_t*)malloc(total_size);
+int add_handle(const native_handle_t& handle)
+{
+    const size_t total_size =
+        sizeof(native_handle_t) + (size_t(handle.numFds) + size_t(handle.numInts)) * sizeof(int);
+    native_handle_t* copied_handle = (native_handle_t*)::malloc(total_size);
     if (!copied_handle) {
         printf("Memory allocation failed for handle copy\n");
         return -1;
@@ -433,19 +343,16 @@ int add_handle(const native_handle_t& handle) {
         next_id = 1;
 
     int id = next_id++;
-    handles_map[id] = std::unique_ptr<native_handle_t>(copied_handle);
+    BufferEntry &e = g_buffers[id];
+    e.handle.reset(copied_handle);
+    e.rwb.reset();
     return id;
 }
 
-static inline native_handle_t* get_handle_locked_nolock(int id)
+static inline BufferEntry* get_entry_locked_nolock(int id)
 {
-    auto it = handles_map.find(id);
-    return (it != handles_map.end()) ? it->second.get() : nullptr;
-}
-
-native_handle_t* get_handle(int id) {
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    return get_handle_locked_nolock(id);
+    auto it = g_buffers.find(id);
+    return (it != g_buffers.end()) ? &it->second : nullptr;
 }
 
 static inline void init_free_driver_slots_once() {
@@ -668,62 +575,57 @@ HWC2EventListener eventListener = {
 };
 
 void add_buf_to_map(void *data, int poll_id, int drm_fd) {
-    int fd;
-    int id = -1;
-    memcpy(&fd, data, sizeof(int));
-    if (fcntl(fd, F_GETFD) == -1) {
+    int fd = -1;
+    std::memcpy(&fd, data, sizeof(int));
+    if (fd < 0 || fcntl(fd, F_GETFD) == -1) {
         printf("Invalid or closed file descriptor: %d\n", fd);
         return;
     }
+
     int header[3];
     if (pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) {
-        printf("Fd1 read failed fd: %d\n", fd);
+        printf("Fd read header failed fd: %d\n", fd);
+        close(fd);
         return;
     }
-    int version = header[0];
-    int numFds = header[1];
-    int numInts = header[2];
 
-    size_t total_size = sizeof(native_handle_t) + ((size_t)numFds + (size_t)numInts) * sizeof(int);
-    void *blk = g_small_pool.alloc(total_size);
-    native_handle_t *full_handle = (native_handle_t*)blk;
+    const int version = header[0];
+    const int numFds  = header[1];
+    const int numInts = header[2];
+    if (version <= 0 || numFds < 0 || numInts < 0) {
+        printf("Bad native_handle header v=%d fds=%d ints=%d (fd=%d)\n",
+               version, numFds, numInts, fd);
+        close(fd);
+        return;
+    }
+
+    const size_t total_size =
+        sizeof(native_handle_t) + (size_t(numFds) + size_t(numInts)) * sizeof(int);
+
+    native_handle_t *full_handle = (native_handle_t*)::malloc(total_size);
     if (!full_handle) {
         printf("malloc failed size: %zu\n", total_size);
+        close(fd);
         return;
     }
+
     std::memcpy(full_handle, header, sizeof(header));
     const size_t already = sizeof(header);
-    const size_t remain = (total_size > already) ? (total_size - already) : 0;
+    const size_t remain  = (total_size > already) ? (total_size - already) : 0;
     if (remain) {
         if (pread(fd, (char*)full_handle + already, remain, (off_t)already) != (ssize_t)remain) {
-            g_small_pool.dealloc(blk, total_size);
-            printf("Fd read failed fd: %d", fd);
+            printf("Fd read body failed fd: %d\n", fd);
+            ::free(full_handle);
+            close(fd);
             return;
         }
     }
-    {
-        const uint64_t h = make_handle_hash(full_handle);
-        auto it = handle_index.find(h);
-        if (it != handle_index.end()) {
-            for (int cand_id : it->second) {
-                native_handle_t *cand = get_handle(cand_id);
-                if (handles_equal(full_handle, cand)) {
-                    id = cand_id;
-                    break;
-                }
-            }
-        }
-        if (id == -1) {
-            id = add_handle(*full_handle);
-            handle_hash_by_id[id] = h;
-            auto &vec = handle_index[h];
-            if (vec.empty()) vec.reserve(4);
-            vec.push_back(id);
-        }
-    }
 
+    // always assign a new id per incoming handle.
+    const int id = add_handle(*full_handle);
+
+    ::free(full_handle);
     close(fd);
-    g_small_pool.dealloc(full_handle, total_size);
 
     struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
     if (drm_ioctl(DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd) < 0) {
@@ -738,11 +640,28 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     struct drm_evdi_get_buff_callabck cmd;
     memcpy(&id, data, sizeof(int));
 
-    buffer_handle_t handle = get_handle(id);
-    if(!handle) {
-        cmd = {.poll_id = poll_id, .version = -1, .numFds = -1, .numInts = -1, .fd_ints = nullptr, .data_ints = nullptr};
+    std::memset(&cmd, 0, sizeof(cmd));
+    cmd.poll_id = poll_id;
+
+    native_handle_t* handle = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+        BufferEntry* E = get_entry_locked_nolock(id);
+        handle = (E && E->handle) ? E->handle.get() : nullptr;
+    }
+
+    if (!handle) {
+        cmd.version = -1;
+        cmd.numFds  = -1;
+        cmd.numInts = -1;
+        cmd.fd_ints   = nullptr;
+        cmd.data_ints = nullptr;
     } else {
-        cmd = {.poll_id = poll_id, .version = handle->version, .numFds = handle->numFds, .numInts = handle->numInts, .fd_ints = const_cast<int *>(&handle->data[0]), .data_ints = const_cast<int *>(&handle->data[handle->numFds])};
+        cmd.version = handle->version;
+        cmd.numFds  = handle->numFds;
+        cmd.numInts = handle->numInts;
+        cmd.fd_ints   = const_cast<int *>(&handle->data[0]);
+        cmd.data_ints = const_cast<int *>(&handle->data[handle->numFds]);
     }
 //    printf("get_buf_from_map id: %d, version: %d\n", id, handle->version);
     ioctl(drm_fd, DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
@@ -774,7 +693,8 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        in_handle = get_handle_locked_nolock(id);
+        BufferEntry *E = get_entry_locked_nolock(id);
+        in_handle = (E && E->handle) ? E->handle.get() : nullptr;
         if (unlikely(in_handle == nullptr)) {
             printf("Failed to find buf: %d\n", id);
             return;
@@ -782,24 +702,24 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         Display& D = get_or_create_display(drv_display_id);
         Dsnap = D;
         hwcDisp = D.hwcDisplay;
-        slot = slot_for_buffer_locked(drv_display_id, id);
+        slot = slot_for_display_locked(drv_display_id);
 
         if (!hwcDisp || D.width == 0 || D.height == 0 || D.stride == 0) {
             return;
         }
-
-        auto it_buf = buffers_map.find(id);
-        if (it_buf == buffers_map.end()) {
-            void* mem = g_rwb_pool.acquire();
-            RemoteWindowBuffer* rb = new (mem) RemoteWindowBuffer(
-                D.width, D.height, D.stride, HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage, in_handle);
-            it_buf = buffers_map.emplace(id, UniqueRwb(rb)).first;
-        }
-        buf = it_buf->second.get();
-        if (buf && (buf->width != D.width || buf->height != D.height || buf->stride != D.stride)) {
-            buf->~RemoteWindowBuffer();
-            new (buf) RemoteWindowBuffer(
-                D.width, D.height, D.stride, HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage, in_handle);
+        if (E) {
+            if (!E->rwb) {
+                E->rwb.reset(alloc_rwb(D.width, D.height, D.stride,
+                                      HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage, in_handle));
+            } else {
+                RemoteWindowBuffer *cur = E->rwb.get();
+                if (cur->width != D.width || cur->height != D.height || cur->stride != D.stride) {
+                    E->rwb.reset();
+                    E->rwb.reset(alloc_rwb(D.width, D.height, D.stride,
+                                          HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage, in_handle));
+                }
+            }
+            buf = E->rwb.get();
         }
     }
 
@@ -841,36 +761,11 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         int ret;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
-
-            erase_slots_for_id_locked(id);
-
-            native_handle_t *handle = get_handle_locked_nolock(id);
-            if (handle) {
-                native_handle_close(handle);
+            BufferEntry *E = get_entry_locked_nolock(id);
+            if (E && E->handle) {
+                native_handle_close(E->handle.get());
             }
-
-            auto it_hh = handle_hash_by_id.find(id);
-            if (it_hh != handle_hash_by_id.end()) {
-                const uint64_t hh = it_hh->second;
-                auto it_vec = handle_index.find(hh);
-                if (it_vec != handle_index.end()) {
-                    auto &vec = it_vec->second;
-                    for (size_t i = 0; i < vec.size(); ++i) {
-                        if (vec[i] == id) {
-                            vec[i] = vec.back();
-                            vec.pop_back();
-                            break;
-                        }
-                    }
-                    if (vec.empty()) {
-                        handle_index.erase(it_vec);
-                    }
-                }
-                handle_hash_by_id.erase(it_hh);
-            }
-
-            buffers_map.erase(id);
-            handles_map.erase(id);
+            g_buffers.erase(id);
         }
 
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
@@ -939,8 +834,11 @@ int update_display(int display_id) {
         if (D.width == (int)config->width && D.height == (int)config->height && D.stride != 0)
             return 0;
 
-        buffers_map.clear();
-        reset_slots_for_display_locked(display_id);
+        for (auto &kv : g_buffers) {
+            kv.second.rwb.reset();
+        }
+        if (display_id >= 0 && display_id < kMaxDriverDisplays)
+            g_slot_cursor[display_id] = 0;
         D.width = config->width;
         D.height = config->height;
         D.stride = 0;
@@ -1006,11 +904,8 @@ static void disconnect_display(int drv_id)
         D.width = D.height = 0;
         D.stride = 0;
         D.connected = false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        reset_slots_for_display_locked(drv_id);
+        if (drv_id >= 0 && drv_id < kMaxDriverDisplays)
+            g_slot_cursor[drv_id] = 0;
     }
 }
 
@@ -1085,7 +980,8 @@ static void poll_thread_main()
                         kv.second.width = 0;
                         kv.second.height = 0;
                         kv.second.stride = 0;
-                        reset_slots_for_display_locked(kv.first);
+                        if (kv.first >= 0 && kv.first < kMaxDriverDisplays)
+                            g_slot_cursor[kv.first] = 0;
                         schedule_update(kv.first);
                     }
                 }
@@ -1155,10 +1051,7 @@ int main() {
 
     init_free_driver_slots_once();
 
-    handle_index.max_load_factor(0.5f);
-    handle_index.reserve(kExpectedHandles);
-    handles_map.reserve(kExpectedHandles);
-    buffers_map.reserve(kExpectedHandles);
+    g_buffers.reserve(kExpectedHandles);
     g_displays.reserve(kMaxDriverDisplays);
     g_hwc_to_drv.reserve(kMaxDriverDisplays);
     g_drv_to_hwc.reserve(kMaxDriverDisplays);
