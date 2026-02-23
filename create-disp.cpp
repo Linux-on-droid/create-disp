@@ -406,16 +406,21 @@ struct PresentJob {
 
 static inline void enqueue_present_job(PresentJob&& j)
 {
+    std::vector<int> acks;
     {
         std::lock_guard<std::mutex> lk(g_present_mutex);
         for (auto it = g_present_q.begin(); it != g_present_q.end(); ) {
             if (it->drv_display_id == j.drv_display_id) {
+                acks.push_back(it->poll_id);
                 it = g_present_q.erase(it);
             } else {
                 ++it;
             }
         }
         g_present_q.push_back(std::move(j));
+    }
+    for (int poll_id : acks) {
+        (void)evdi_swap_reply(poll_id);
     }
     g_present_cv.notify_one();
 }
