@@ -22,6 +22,7 @@
 #include <set>
 #include <deque>
 #include <chrono>
+#include <array>
 #include <thread>
 #include <atomic>
 #include <csignal>
@@ -89,13 +90,19 @@ static_assert(kSlotsPerDisplay >= 4, "Need at least 4 slots per display");
 static_assert(kSlotsPerDisplay * uint32_t(kMaxDriverDisplays) <= kHwcMaxSlots, "Slot partition overflow");
 static inline uint32_t slot_for_buffer(int display_id, int buf_id)
 {
-    if (display_id < 0 || display_id >= kMaxDriverDisplays) return 0;
-    const uint32_t base = uint32_t(display_id) * kSlotsPerDisplay;
-    const uint32_t idx  = uint32_t(uint32_t(buf_id) % kSlotsPerDisplay);
-    return base + idx;
+    return uint32_t(uint32_t(buf_id) % kHwcMaxSlots);
 }
 
 static std::mutex g_state_mutex;
+static std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
+
+struct ScopedHwcLock {
+    std::unique_lock<std::mutex> lk;
+    explicit ScopedHwcLock(int display_id) {
+        if (display_id >= 0 && display_id < kMaxDriverDisplays)
+            lk = std::unique_lock<std::mutex>(g_hwc_mutex[display_id]);
+    }
+};
 
 static std::shared_mutex g_drm_mutex;
 
@@ -401,6 +408,13 @@ static inline void enqueue_present_job(PresentJob&& j)
 {
     {
         std::lock_guard<std::mutex> lk(g_present_mutex);
+        for (auto it = g_present_q.begin(); it != g_present_q.end(); ) {
+            if (it->drv_display_id == j.drv_display_id) {
+                it = g_present_q.erase(it);
+            } else {
+                ++it;
+            }
+        }
         g_present_q.push_back(std::move(j));
     }
     g_present_cv.notify_one();
@@ -432,8 +446,15 @@ static void present_thread_main()
             continue;
         }
 
+        if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays) {
+            (void)evdi_swap_reply(j.poll_id);
+            continue;
+        }
+
         uint32_t numTypes = 0, numRequests = 0;
         hwc2_error_t err = HWC2_ERROR_NONE;
+
+        ScopedHwcLock hwclk(j.drv_display_id);
 
         err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
                                                     -1, HAL_DATASPACE_UNKNOWN);
@@ -902,6 +923,7 @@ int update_display(int display_id) {
     printf("display %d width: %i height: %i\n", display_id, config->width, config->height);
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
+        ScopedHwcLock hwclk(display_id);
         Display& D = get_or_create_display(display_id);
         if (D.width == (int)config->width && D.height == (int)config->height && D.stride != 0)
             return 0;
@@ -971,6 +993,7 @@ static void disconnect_display(int drv_id)
 
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
+        ScopedHwcLock hwclk(drv_id);
         Display& D = get_or_create_display(drv_id);
         const long long hwc_id = D.hwc_id;
         if (D.layer && D.hwcDisplay)
