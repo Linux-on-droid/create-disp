@@ -26,6 +26,7 @@
 #include <atomic>
 #include <csignal>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 
 #include <systemd/sd-daemon.h>
@@ -96,7 +97,7 @@ static inline uint32_t slot_for_buffer(int display_id, int buf_id)
 
 static std::mutex g_state_mutex;
 
-static std::mutex g_drm_mutex;
+static std::shared_mutex g_drm_mutex;
 
 static std::mutex g_update_mutex;
 static std::condition_variable g_update_cv;
@@ -107,6 +108,11 @@ static bool g_enqueued[kMaxDriverDisplays] = {};
 static std::thread g_update_thread;
 
 static std::atomic<bool> g_reopen_requested{false};
+
+static std::mutex g_present_mutex;
+static std::condition_variable g_present_cv;
+static std::deque<struct PresentJob> g_present_q;
+static std::thread g_present_thread;
 
 static inline void request_reopen()
 {
@@ -124,7 +130,7 @@ static inline int ioctl_retry(int fd, unsigned long req, void *arg)
 
 static inline int drm_ioctl(unsigned long req, void *arg)
 {
-    std::lock_guard<std::mutex> lk(g_drm_mutex);
+    std::shared_lock<std::shared_mutex> lk(g_drm_mutex);
     extern int drm_fd;
     if (drm_fd < 0) {
         errno = EBADF;
@@ -380,6 +386,71 @@ static inline std::shared_ptr<BufferEntry> get_entry_locked_nolock(int id)
 {
     auto it = g_buffers.find(id);
     return (it != g_buffers.end()) ? it->second : nullptr;
+}
+
+struct PresentJob {
+    int poll_id = -1;
+    int drv_display_id = 0;
+    int buf_id = -1;
+    uint32_t slot = 0;
+    std::shared_ptr<BufferEntry> entry;
+    SharedRwb rwb;
+};
+
+static inline void enqueue_present_job(PresentJob&& j)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_present_mutex);
+        g_present_q.push_back(std::move(j));
+    }
+    g_present_cv.notify_one();
+}
+
+static void present_thread_main()
+{
+    while (g_running.load(std::memory_order_acquire)) {
+        PresentJob j;
+        {
+            std::unique_lock<std::mutex> lk(g_present_mutex);
+            g_present_cv.wait(lk, []{
+                return !g_running.load(std::memory_order_acquire) || !g_present_q.empty();
+            });
+            if (!g_running.load(std::memory_order_acquire))
+                break;
+            j = std::move(g_present_q.front());
+            g_present_q.pop_front();
+        }
+
+        hwc2_compat_display_t* hwcDisp = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            Display& D = get_or_create_display(j.drv_display_id);
+            hwcDisp = D.hwcDisplay;
+        }
+        if (!hwcDisp || !j.rwb) {
+            (void)evdi_swap_reply(j.poll_id);
+            continue;
+        }
+
+        uint32_t numTypes = 0, numRequests = 0;
+        hwc2_error_t err = HWC2_ERROR_NONE;
+
+        err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
+                                                    -1, HAL_DATASPACE_UNKNOWN);
+        if (err != HWC2_ERROR_NONE)
+            fprintf(stderr, "set_client_target failed: %d\n", (int)err);
+
+        err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
+        if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests))
+            (void)hwc2_compat_display_accept_changes(hwcDisp);
+
+        int presentFence = -1;
+        err = hwc2_compat_display_present(hwcDisp, &presentFence);
+        if (err != HWC2_ERROR_NONE)
+            fprintf(stderr, "present failed: %d\n", (int)err);
+
+        (void)evdi_swap_reply(j.poll_id);
+    }
 }
 
 static inline void init_free_driver_slots_once() {
@@ -694,12 +765,6 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
 
-    struct SwapReplyGuard {
-        int poll_id;
-        bool replied = false;
-        ~SwapReplyGuard() { if (!replied) (void)evdi_swap_reply(poll_id); }
-    } reply{poll_id};
-
     hwc2_compat_display_t* hwcDisp = nullptr;
     Display Dsnap;
     std::shared_ptr<BufferEntry> entry;
@@ -711,6 +776,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         entry = get_entry_locked_nolock(id);
         if (!entry || !entry->handle) {
             printf("Failed to find buf: %d\n", id);
+            (void)evdi_swap_reply(poll_id);
             return;
         }
         Display& D = get_or_create_display(drv_display_id);
@@ -720,6 +786,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     if (unlikely(!hwcDisp || Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0)) {
         printf("Display %d not ready (no HWC or size)\n", drv_display_id);
+        (void)evdi_swap_reply(poll_id);
         return;
     }
 
@@ -742,33 +809,19 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     if (unlikely(!rwb)) {
         printf("Failed to allocate RemoteWindowBuffer for id=%d\n", id);
+        (void)evdi_swap_reply(poll_id);
         return;
     }
 
-    error = hwc2_compat_display_set_client_target(hwcDisp,
-                                                 slot,
-                                                 rwb.get(),
-                                                 -1,
-                                                 HAL_DATASPACE_UNKNOWN);
-    if (error != HWC2_ERROR_NONE) {
-        fprintf(stderr, "set_client_target failed: %d\n", (int)error);
-    }
-
-    error = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
-    if (error != HWC2_ERROR_NONE) {
-        fprintf(stderr, "validate failed: %d\n", (int)error);
-        //return;
-    }
-
-    if (numTypes || numRequests)
-        (void)hwc2_compat_display_accept_changes(hwcDisp);
-
-    int presentFence = -1;
-    (void)hwc2_compat_display_present(hwcDisp, &presentFence);
-
-    if (evdi_swap_reply(poll_id) == 0)
-        reply.replied = true;
-
+    // Offload blocking to present thread
+    PresentJob j;
+    j.poll_id = poll_id;
+    j.drv_display_id = drv_display_id;
+    j.buf_id = id;
+    j.slot = slot;
+    j.entry = std::move(entry);
+    j.rwb = std::move(rwb);
+    enqueue_present_job(std::move(j));
     return;
 }
 
@@ -990,7 +1043,7 @@ static void poll_thread_main()
             break;
 
         if (g_reopen_requested.exchange(false, std::memory_order_acq_rel)) {
-            std::lock_guard<std::mutex> lk(g_drm_mutex);
+            std::unique_lock<std::shared_mutex> lk(g_drm_mutex);
 
             if (drm_fd >= 0) {
                 ::close(drm_fd);
@@ -1135,6 +1188,17 @@ int main() {
     sd_notify(0, "READY=1");
     sd_notify(0, "STATUS=create-disp ready.");
 
+    // Start present thread
+    try {
+        g_present_thread = std::thread(present_thread_main);
+    } catch (...) {
+        fprintf(stderr, "Failed to create present thread\n");
+        g_running.store(false, std::memory_order_release);
+        g_update_cv.notify_all();
+        close(drm_fd);
+        return EXIT_FAILURE;
+    }
+
     // Start poll thread
     try {
         g_poll_thread = std::thread(poll_thread_main);
@@ -1153,6 +1217,11 @@ int main() {
     sd_notify(0, "STATUS=Stopping poll thread…");
     if (g_poll_thread.joinable())
         g_poll_thread.join();
+
+    sd_notify(0, "STATUS=Stopping present thread…");
+    g_present_cv.notify_all();
+    if (g_present_thread.joinable())
+        g_present_thread.join();
 
     sd_notify(0, "STATUS=Stopping update thread…");
     g_update_cv.notify_all();
