@@ -231,6 +231,8 @@ static inline SharedRwb make_rwb(int w, int h, uint32_t stride,
 }
 } // namespace
 
+struct BufferEntry;
+
 struct Display {
     int display_id = -1;
     long long hwc_id = 0;
@@ -240,6 +242,7 @@ struct Display {
     bool connected = false;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
+    SharedRwb active_rwb;
 
     Display() = default;
     Display(const Display& other) {
@@ -254,6 +257,7 @@ struct Display {
         connected = other.connected;
         hwcDisplay = other.hwcDisplay;
         layer = other.layer;
+        active_rwb = other.active_rwb;
         return *this;
     }
 };
@@ -285,13 +289,6 @@ static inline Display& get_or_create_display(int display_id) {
 
 hwc2_compat_device_t* hwcDevice;
 
-struct HandleFreeDeleter {
-    void operator()(native_handle_t* h) const {
-        if (h) ::free(h);
-    }
-};
-using UniqueHandle = std::unique_ptr<native_handle_t, HandleFreeDeleter>;
-
 enum class BufferOrigin : uint8_t {
     Imported = 0,
     Allocated = 1,
@@ -299,7 +296,7 @@ enum class BufferOrigin : uint8_t {
 
 struct BufferEntry {
     BufferOrigin origin = BufferOrigin::Imported;
-    UniqueHandle handle;
+    native_handle_t* handle = nullptr;
     // created first swap_to:
     SharedRwb rwb;
     // Track geometry used to build rwb so we can detect mismatch
@@ -307,13 +304,12 @@ struct BufferEntry {
     int rwb_h = 0;
     uint32_t rwb_stride = 0;
     uint32_t stride_px = 0;
-
     ~BufferEntry() {
-        if (!handle) return;
-        if (origin == BufferOrigin::Allocated) {
-            (void)hybris_gralloc_release((buffer_handle_t)handle.get(), /*was_allocated=*/1);
-        } else {
-            native_handle_close(handle.get());
+        rwb.reset();
+        if (origin == BufferOrigin::Imported && handle) {
+            for (int i = 0; i < handle->numFds; i++)
+                close(handle->data[i]);
+            free(handle);
         }
     }
 };
@@ -400,17 +396,8 @@ static inline int evdi_vsync(int drv_display_id)
     return ioctl_retry(fd, DRM_IOCTL_EVDI_VSYNC, &cmd);
 }
 
-int add_handle(const native_handle_t& handle, BufferOrigin origin)
+int add_handle(native_handle_t* handle, BufferOrigin origin)
 {
-    const size_t total_size =
-        sizeof(native_handle_t) + (size_t(handle.numFds) + size_t(handle.numInts)) * sizeof(int);
-    native_handle_t* copied_handle = (native_handle_t*)::malloc(total_size);
-    if (!copied_handle) {
-        printf("Memory allocation failed for handle copy\n");
-        return -1;
-    }
-    memcpy(copied_handle, &handle, total_size);
-
     std::lock_guard<std::mutex> lk(g_state_mutex);
 
     if (next_id <= 0)
@@ -419,7 +406,8 @@ int add_handle(const native_handle_t& handle, BufferOrigin origin)
     int id = next_id++;
     auto e = std::make_shared<BufferEntry>();
     e->origin = origin;
-    e->handle.reset(copied_handle);
+    e->handle = handle;
+
     g_buffers[id] = std::move(e);
     return id;
 }
@@ -496,8 +484,13 @@ static void present_thread_main()
 
         int presentFence = -1;
         err = hwc2_compat_display_present(hwcDisp, &presentFence);
-        if (err != HWC2_ERROR_NONE)
+        if (err != HWC2_ERROR_NONE) {
             fprintf(stderr, "present failed: %d\n", (int)err);
+        } else {
+            std::lock_guard<std::mutex> state_lk(g_state_mutex);
+            Display& D = get_or_create_display(j.drv_display_id);
+            D.active_rwb = j.rwb;
+        }
     }
 }
 
@@ -772,7 +765,7 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
     }
 
     // always assign a new id per incoming handle.
-    const int id = add_handle(*full_handle, BufferOrigin::Imported);
+    const int id = add_handle(full_handle, BufferOrigin::Imported);
 
     // Extract the pixel stride from the native_handle
     {
@@ -783,7 +776,6 @@ void add_buf_to_map(void *data, int poll_id, int drm_fd) {
         }
     }
 
-    ::free(full_handle);
     close(fd);
 
     struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
@@ -806,7 +798,7 @@ void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         std::shared_ptr<BufferEntry> E = get_entry_locked_nolock(id);
-        handle = (E && E->handle) ? E->handle.get() : nullptr;
+        handle = (E && E->handle) ? E->handle : nullptr;
     }
 
     if (!handle) {
@@ -871,7 +863,7 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
             entry->rwb_w != Dsnap.width || entry->rwb_h != Dsnap.height || entry->rwb_stride != buf_stride) {
             entry->rwb = make_rwb(Dsnap.width, Dsnap.height, buf_stride,
                                   HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage,
-                                  entry->handle.get());
+                                  entry->handle);
             entry->rwb_w = Dsnap.width;
             entry->rwb_h = Dsnap.height;
             entry->rwb_stride = buf_stride;
@@ -927,7 +919,7 @@ void create_buff(void *data, int poll_id, int drm_fd) {
         (void)drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
         return;
     }
-    cmd.id = add_handle(*full_handle, BufferOrigin::Allocated);
+    cmd.id = add_handle(const_cast<native_handle_t*>(full_handle), BufferOrigin::Allocated);
     cmd.poll_id = poll_id;
     drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 
@@ -995,6 +987,7 @@ int update_display(int display_id) {
         if (D.layer && D.hwcDisplay) {
             hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
             D.layer = nullptr;
+            D.active_rwb.reset();
         }
         if (D.hwcDisplay) {
             D.layer = hwc2_compat_display_create_layer(D.hwcDisplay);
@@ -1061,6 +1054,7 @@ static void disconnect_display(int drv_id)
         D.stride = 0;
         D.connected = false;
         D.hwc_id = 0;
+        D.active_rwb.reset();
         if (hwc_id != 0)
             release_driver_slot_for_hwc(hwc_id);
     }
