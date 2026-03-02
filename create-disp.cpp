@@ -853,8 +853,7 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
     const native_handle_t *full_handle;
     int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888,
-                                      GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
-                                      (buffer_handle_t*)&full_handle, &cmd.stride);
+                                      kRwbUsage, (buffer_handle_t*)&full_handle, &cmd.stride);
     if (ret != 0) {
         fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
         cmd.id = -1;
@@ -946,8 +945,7 @@ int update_display(int display_id) {
     }
     buffer_handle_t handle = NULL;
     int r = hybris_gralloc_allocate(config->width, config->height, HAL_PIXEL_FORMAT_RGBA_8888,
-                                   GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_COMPOSER,
-                                   &handle, &Dsnap.stride);
+                                   kRwbUsage, &handle, &Dsnap.stride);
     if (r == 0 && handle) {
         // Free immediately since this was only used to determine stride
         (void)hybris_gralloc_release(handle, /*was_allocated=*/1);
