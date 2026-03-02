@@ -715,75 +715,6 @@ HWC2EventListener eventListener = {
     &onRefreshReceived
 };
 
-void add_buf_to_map(void *data, int poll_id, int drm_fd) {
-    int fd = -1;
-    std::memcpy(&fd, data, sizeof(int));
-    if (fd < 0 || fcntl(fd, F_GETFD) == -1) {
-        printf("Invalid or closed file descriptor: %d\n", fd);
-        return;
-    }
-
-    int header[3];
-    if (pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) {
-        printf("Fd read header failed fd: %d\n", fd);
-        close(fd);
-        return;
-    }
-
-    const int version = header[0];
-    const int numFds  = header[1];
-    const int numInts = header[2];
-    if (version <= 0 || numFds < 0 || numInts < 0) {
-        printf("Bad native_handle header v=%d fds=%d ints=%d (fd=%d)\n",
-               version, numFds, numInts, fd);
-        close(fd);
-        return;
-    }
-
-    const size_t total_size =
-        sizeof(native_handle_t) + (size_t(numFds) + size_t(numInts)) * sizeof(int);
-
-    native_handle_t *full_handle = (native_handle_t*)::malloc(total_size);
-    if (!full_handle) {
-        printf("malloc failed size: %zu\n", total_size);
-        close(fd);
-        return;
-    }
-
-    std::memcpy(full_handle, header, sizeof(header));
-    const size_t already = sizeof(header);
-    const size_t remain  = (total_size > already) ? (total_size - already) : 0;
-    if (remain) {
-        if (pread(fd, (char*)full_handle + already, remain, (off_t)already) != (ssize_t)remain) {
-            printf("Fd read body failed fd: %d\n", fd);
-            ::free(full_handle);
-            close(fd);
-            return;
-        }
-    }
-
-    // always assign a new id per incoming handle.
-    const int id = add_handle(full_handle, BufferOrigin::Imported);
-
-    // Extract the pixel stride from the native_handle
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        auto it = g_buffers.find(id);
-        if (it != g_buffers.end() && it->second && full_handle->numInts >= 4) {
-            it->second->stride_px = (uint32_t)full_handle->data[full_handle->numFds + 3];
-        }
-    }
-
-    close(fd);
-
-    struct drm_evdi_add_buff_callabck cmd = {.poll_id=poll_id, .buff_id=id};
-    if (drm_ioctl(DRM_IOCTL_EVDI_ADD_BUFF_CALLBACK, &cmd) < 0) {
-        if (errno == ENODEV || errno == EBADF) {
-            request_reopen();
-        }
-    }
-}
-
 void get_buf_from_map(void *data, int poll_id, int drm_fd) {
     int id;
     struct drm_evdi_get_buff_callabck cmd;
@@ -1182,9 +1113,6 @@ static void poll_thread_main()
         }
 
         switch (poll_cmd.event) {
-        case add_buf:
-            add_buf_to_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
-            break;
         case get_buf:
             get_buf_from_map(poll_cmd.data, poll_cmd.poll_id, drm_fd);
             break;
