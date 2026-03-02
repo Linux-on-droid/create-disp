@@ -91,11 +91,6 @@ static constexpr uint32_t kHwcMaxSlots = 64;
 static constexpr uint32_t kSlotsPerDisplay = kHwcMaxSlots / uint32_t(kMaxDriverDisplays);
 static_assert(kSlotsPerDisplay >= 4, "Need at least 4 slots per display");
 static_assert(kSlotsPerDisplay * uint32_t(kMaxDriverDisplays) <= kHwcMaxSlots, "Slot partition overflow");
-static inline uint32_t slot_for_buffer(int display_id, int buf_id)
-{
-    const uint32_t base = uint32_t(display_id) * kSlotsPerDisplay;
-    return base + (uint32_t(buf_id) % kSlotsPerDisplay);
-}
 
 static std::mutex g_state_mutex;
 static std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
@@ -243,6 +238,7 @@ struct Display {
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
     SharedRwb active_rwb;
+    uint32_t next_slot_index = 0;
 
     Display() = default;
     Display(const Display& other) {
@@ -258,6 +254,7 @@ struct Display {
         hwcDisplay = other.hwcDisplay;
         layer = other.layer;
         active_rwb = other.active_rwb;
+        next_slot_index = other.next_slot_index;
         return *this;
     }
 };
@@ -304,6 +301,7 @@ struct BufferEntry {
     int rwb_h = 0;
     uint32_t rwb_stride = 0;
     uint32_t stride_px = 0;
+    uint32_t assigned_slot = std::numeric_limits<uint32_t>::max();
     ~BufferEntry() {
         rwb.reset();
         if (origin == BufferOrigin::Imported && handle) {
@@ -853,7 +851,22 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
         return;
     }
 
-    slot = slot_for_buffer(drv_display_id, id);
+    {
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+        if (entry->assigned_slot == std::numeric_limits<uint32_t>::max()) {
+            Display& D = get_or_create_display(drv_display_id);
+            const uint32_t base_slot = (uint32_t)drv_display_id * kSlotsPerDisplay;
+            entry->assigned_slot = base_slot + (D.next_slot_index % kSlotsPerDisplay);
+            D.next_slot_index++;
+        }
+        slot = entry->assigned_slot;
+    }
+
+    if (slot >= kHwcMaxSlots) {
+        fprintf(stderr, "Invalid HWC slot %u (max %u) for display %d\n",
+                slot, kHwcMaxSlots, drv_display_id);
+        return;
+    }
 
     // Check RWB matches display geometry
     {
