@@ -300,8 +300,8 @@ struct BufferEntry {
     int rwb_w = 0;
     int rwb_h = 0;
     uint32_t rwb_stride = 0;
-    uint32_t stride_px = 0;
     uint32_t assigned_slot = std::numeric_limits<uint32_t>::max();
+
     ~BufferEntry() {
         rwb.reset();
         if (origin == BufferOrigin::Imported && handle) {
@@ -802,15 +802,14 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     // Check RWB matches display geometry
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        const uint32_t buf_stride = (entry->stride_px != 0) ? entry->stride_px : Dsnap.stride;
         if (!entry->rwb ||
-            entry->rwb_w != Dsnap.width || entry->rwb_h != Dsnap.height || entry->rwb_stride != buf_stride) {
-            entry->rwb = make_rwb(Dsnap.width, Dsnap.height, buf_stride,
+            entry->rwb_w != Dsnap.width || entry->rwb_h != Dsnap.height || entry->rwb_stride != Dsnap.stride) {
+            entry->rwb = make_rwb(Dsnap.width, Dsnap.height, Dsnap.stride,
                                   HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage,
                                   entry->handle);
             entry->rwb_w = Dsnap.width;
             entry->rwb_h = Dsnap.height;
-            entry->rwb_stride = buf_stride;
+            entry->rwb_stride = Dsnap.stride;
         }
         rwb = entry->rwb;
     }
@@ -865,14 +864,6 @@ void create_buff(void *data, int poll_id, int drm_fd) {
     cmd.id = add_handle(const_cast<native_handle_t*>(full_handle), BufferOrigin::Allocated);
     cmd.poll_id = poll_id;
     drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
-
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        auto it = g_buffers.find(cmd.id);
-        if (it != g_buffers.end() && it->second) {
-            it->second->stride_px = cmd.stride;
-        }
-    }
 }
 
 static inline int hz_from_period_ns(int32_t ns)
