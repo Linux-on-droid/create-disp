@@ -300,15 +300,24 @@ struct BufferEntry {
     int rwb_w = 0;
     int rwb_h = 0;
     uint32_t rwb_stride = 0;
+    int rwb_format = 0;
+    int format;
+    uint32_t stride;
+    int width;
+    int height;
     uint32_t assigned_slot = std::numeric_limits<uint32_t>::max();
 
     ~BufferEntry() {
         rwb.reset();
-        if (origin == BufferOrigin::Imported && handle) {
+        if (!handle) return;
+        if (origin == BufferOrigin::Imported) {
             for (int i = 0; i < handle->numFds; i++)
                 close(handle->data[i]);
             free(handle);
+        } else {
+            (void)hybris_gralloc_release((buffer_handle_t)handle, 1);
         }
+        handle = nullptr;
     }
 };
 
@@ -394,7 +403,12 @@ static inline int evdi_vsync(int drv_display_id)
     return ioctl_retry(fd, DRM_IOCTL_EVDI_VSYNC, &cmd);
 }
 
-int add_handle(native_handle_t* handle, BufferOrigin origin)
+static inline int add_handle(native_handle_t* handle,
+                                BufferOrigin origin,
+                                int format,
+                                uint32_t stride,
+                                uint32_t width,
+                                uint32_t height)
 {
     std::lock_guard<std::mutex> lk(g_state_mutex);
 
@@ -405,6 +419,11 @@ int add_handle(native_handle_t* handle, BufferOrigin origin)
     auto e = std::make_shared<BufferEntry>();
     e->origin = origin;
     e->handle = handle;
+
+    e->format = format;
+    e->stride = stride;
+    e->width = width;
+    e->height = height;
 
     g_buffers[id] = std::move(e);
     return id;
@@ -802,14 +821,19 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
     // Check RWB matches display geometry
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        if (!entry->rwb ||
-            entry->rwb_w != Dsnap.width || entry->rwb_h != Dsnap.height || entry->rwb_stride != Dsnap.stride) {
-            entry->rwb = make_rwb(Dsnap.width, Dsnap.height, Dsnap.stride,
-                                  HAL_PIXEL_FORMAT_RGBA_8888, kRwbUsage,
-                                  entry->handle);
-            entry->rwb_w = Dsnap.width;
-            entry->rwb_h = Dsnap.height;
-            entry->rwb_stride = Dsnap.stride;
+        const uint32_t buf_stride = (entry->stride != 0) ? entry->stride : Dsnap.stride;
+        const int buf_format = entry->format;
+        const int buf_w = (entry->width != 0) ? entry->width : Dsnap.width;
+        const int buf_h = (entry->height != 0) ? entry->height : Dsnap.height;
+
+        if (!entry->rwb || entry->rwb_w != buf_w || entry->rwb_h != buf_h ||
+            entry->rwb_stride != buf_stride || entry->rwb_format != buf_format) {
+            entry->rwb = make_rwb(buf_w, buf_h, buf_stride, buf_format,
+                                  kRwbUsage, entry->handle);
+            entry->rwb_w = buf_w;
+            entry->rwb_h = buf_h;
+            entry->rwb_stride = buf_stride;
+            entry->rwb_format = buf_format;
         }
         rwb = entry->rwb;
     }
@@ -846,12 +870,13 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
 
 
 void create_buff(void *data, int poll_id, int drm_fd) {
-//printf("Hi from create_buff\n");
     struct drm_evdi_gbm_create_buff buff_params;
     struct drm_evdi_create_buff_callabck cmd;
     memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
     const native_handle_t *full_handle;
-    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, HAL_PIXEL_FORMAT_RGBA_8888,
+    int req_format = (buff_params.format != 0) ? (int)buff_params.format : HAL_PIXEL_FORMAT_RGBA_8888;
+
+    int ret = hybris_gralloc_allocate(buff_params.width, buff_params.height, req_format,
                                       kRwbUsage, (buffer_handle_t*)&full_handle, &cmd.stride);
     if (ret != 0) {
         fprintf(stderr, "[libgbm-hybris] hybris_gralloc_allocate failed: %d\n", ret);
@@ -861,7 +886,8 @@ void create_buff(void *data, int poll_id, int drm_fd) {
         (void)drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
         return;
     }
-    cmd.id = add_handle(const_cast<native_handle_t*>(full_handle), BufferOrigin::Allocated);
+    cmd.id = add_handle(const_cast<native_handle_t*>(full_handle), BufferOrigin::Allocated,
+                           req_format, cmd.stride, buff_params.width, buff_params.height);
     cmd.poll_id = poll_id;
     drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
 }
@@ -935,7 +961,7 @@ int update_display(int display_id) {
         }
     }
     buffer_handle_t handle = NULL;
-    int r = hybris_gralloc_allocate(config->width, config->height, HAL_PIXEL_FORMAT_RGBA_8888,
+    int r = hybris_gralloc_allocate(config->width, config->height, HAL_PIXEL_FORMAT_RGBX_8888,
                                    kRwbUsage, &handle, &Dsnap.stride);
     if (r == 0 && handle) {
         // Free immediately since this was only used to determine stride
