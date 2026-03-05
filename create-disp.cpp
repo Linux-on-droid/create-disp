@@ -297,7 +297,6 @@ struct Display {
     uint32_t stride = 0;
     bool connected = false;
     hwc2_compat_display_t* hwcDisplay = nullptr;
-    hwc2_compat_layer_t* layer = nullptr;
     SharedRwb active_rwb;
     SlotManager slot_mgr;
 
@@ -313,7 +312,6 @@ struct Display {
         stride = other.stride;
         connected = other.connected;
         hwcDisplay = other.hwcDisplay;
-        layer = other.layer;
         active_rwb = other.active_rwb;
         slot_mgr = other.slot_mgr;
         return *this;
@@ -1002,21 +1000,7 @@ int update_display(int display_id) {
         D.width = config->width;
         D.height = config->height;
         D.stride = 0;
-        if (D.layer && D.hwcDisplay) {
-            hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
-            D.layer = nullptr;
-            D.active_rwb.reset();
-        }
-        if (D.hwcDisplay) {
-            D.layer = hwc2_compat_display_create_layer(D.hwcDisplay);
-            if (D.layer) {
-                hwc2_compat_layer_set_composition_type(D.layer, HWC2_COMPOSITION_CLIENT);
-                hwc2_compat_layer_set_blend_mode(D.layer, HWC2_BLEND_MODE_NONE);
-                hwc2_compat_layer_set_source_crop(D.layer, 0.0f, 0.0f, config->width, config->height);
-                hwc2_compat_layer_set_display_frame(D.layer, 0, 0, config->width, config->height);
-                hwc2_compat_layer_set_visible_region(D.layer, 0, 0, config->width, config->height);
-            }
-        }
+        D.active_rwb.reset();
     }
     buffer_handle_t handle = NULL;
     int r = hybris_gralloc_allocate(config->width, config->height, HAL_PIXEL_FORMAT_RGBX_8888,
@@ -1063,9 +1047,6 @@ static void disconnect_display(int drv_id)
         ScopedHwcLock hwclk(drv_id);
         Display& D = get_or_create_display(drv_id);
         const long long hwc_id = D.hwc_id;
-        if (D.layer && D.hwcDisplay)
-            hwc2_compat_display_destroy_layer(D.hwcDisplay, D.layer);
-        D.layer = nullptr;
         D.hwcDisplay = nullptr;
         D.width = D.height = 0;
         D.stride = 0;
