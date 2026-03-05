@@ -86,12 +86,6 @@ static std::unordered_map<int, long long> g_drv_to_hwc;
 static std::vector<int> g_free_drv_ids;
 static std::atomic<bool> drm_ready{false};
 
-static constexpr uint32_t kHwcMaxSlots = 64;
-
-static constexpr uint32_t kSlotsPerDisplay = kHwcMaxSlots / uint32_t(kMaxDriverDisplays);
-static_assert(kSlotsPerDisplay >= 4, "Need at least 4 slots per display");
-static_assert(kSlotsPerDisplay * uint32_t(kMaxDriverDisplays) <= kHwcMaxSlots, "Slot partition overflow");
-
 static std::mutex g_state_mutex;
 static std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
 
@@ -226,6 +220,73 @@ static inline SharedRwb make_rwb(int w, int h, uint32_t stride,
 }
 } // namespace
 
+struct SlotManager {
+    static constexpr uint32_t kCapacity = 32;
+
+    std::unordered_map<int, uint32_t>      bufid_to_slot;
+    std::unordered_map<uint32_t, int>      slot_to_bufid;
+    std::unordered_map<uint32_t, uint64_t> slot_lastused;
+    std::vector<bool>                      slot_free;
+    uint64_t                               use_counter = 0;
+
+    SlotManager() : slot_free(kCapacity, true) {}
+
+    void reset() {
+        bufid_to_slot.clear();
+        slot_to_bufid.clear();
+        slot_lastused.clear();
+        slot_free.assign(kCapacity, true);
+        use_counter = 0;
+    }
+
+    uint32_t assign(int bufid) {
+        auto it = bufid_to_slot.find(bufid);
+        if (it != bufid_to_slot.end()) {
+            slot_lastused[it->second] = ++use_counter;
+            return it->second;
+        }
+        for (uint32_t i = 0; i < kCapacity; i++) {
+            if (slot_free[i]) {
+                slot_free[i] = false;
+                bufid_to_slot[bufid]  = i;
+                slot_to_bufid[i]      = bufid;
+                slot_lastused[i]      = ++use_counter;
+                return i;
+            }
+        }
+        uint32_t lru_slot = UINT32_MAX;
+        uint64_t lru_time = UINT64_MAX;
+        for (auto& kv : slot_lastused) {
+            if (kv.second < lru_time) {
+                lru_time = kv.second;
+                lru_slot = kv.first;
+            }
+        }
+        if (lru_slot == UINT32_MAX) {
+            fprintf(stderr, "SlotManager: exhausted all %u slots\n", kCapacity);
+            return UINT32_MAX;
+        }
+        int evicted = slot_to_bufid[lru_slot];
+        bufid_to_slot.erase(evicted);
+        bufid_to_slot[bufid]     = lru_slot;
+        slot_to_bufid[lru_slot]  = bufid;
+        slot_lastused[lru_slot]  = ++use_counter;
+        fprintf(stderr, "SlotManager: evicted bufid %d from slot %u for bufid %d\n",
+                evicted, lru_slot, bufid);
+        return lru_slot;
+    }
+
+    void release(int bufid) {
+        auto it = bufid_to_slot.find(bufid);
+        if (it == bufid_to_slot.end()) return;
+        uint32_t slot = it->second;
+        slot_free[slot] = true;
+        slot_to_bufid.erase(slot);
+        slot_lastused.erase(slot);
+        bufid_to_slot.erase(it);
+    }
+};
+
 struct BufferEntry;
 
 struct Display {
@@ -238,7 +299,7 @@ struct Display {
     hwc2_compat_display_t* hwcDisplay = nullptr;
     hwc2_compat_layer_t* layer = nullptr;
     SharedRwb active_rwb;
-    uint32_t next_slot_index = 0;
+    SlotManager slot_mgr;
 
     Display() = default;
     Display(const Display& other) {
@@ -254,7 +315,7 @@ struct Display {
         hwcDisplay = other.hwcDisplay;
         layer = other.layer;
         active_rwb = other.active_rwb;
-        next_slot_index = other.next_slot_index;
+        slot_mgr = other.slot_mgr;
         return *this;
     }
 };
@@ -305,7 +366,6 @@ struct BufferEntry {
     uint32_t stride;
     int width;
     int height;
-    uint32_t assigned_slot = std::numeric_limits<uint32_t>::max();
 
     ~BufferEntry() {
         rwb.reset();
@@ -803,18 +863,13 @@ void swap_to_buff(void *data, int poll_id, int drm_fd) {
 
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        if (entry->assigned_slot == std::numeric_limits<uint32_t>::max()) {
-            Display& D = get_or_create_display(drv_display_id);
-            const uint32_t base_slot = (uint32_t)drv_display_id * kSlotsPerDisplay;
-            entry->assigned_slot = base_slot + (D.next_slot_index % kSlotsPerDisplay);
-            D.next_slot_index++;
-        }
-        slot = entry->assigned_slot;
+        Display& D = get_or_create_display(drv_display_id);
+        slot = D.slot_mgr.assign(id);
     }
 
-    if (slot >= kHwcMaxSlots) {
-        fprintf(stderr, "Invalid HWC slot %u (max %u) for display %d\n",
-                slot, kHwcMaxSlots, drv_display_id);
+    if (slot == UINT32_MAX) {
+        fprintf(stderr, "SlotManager: failed to assign slot for bufid %d on display %d\n",
+                id, drv_display_id);
         return;
     }
 
@@ -860,6 +915,8 @@ void destroy_buff(void *data, int poll_id, int drm_fd) {
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
             g_buffers.erase(id);
+            for (auto& kv : g_displays)
+                kv.second.slot_mgr.release(id);
         }
 
         struct drm_evdi_destroy_buff_callback cmd = {.poll_id=poll_id};
@@ -941,6 +998,7 @@ int update_display(int display_id) {
             if (kv.second)
                 kv.second->rwb.reset();
         }
+        D.slot_mgr.reset();
         D.width = config->width;
         D.height = config->height;
         D.stride = 0;
@@ -1011,6 +1069,7 @@ static void disconnect_display(int drv_id)
         D.hwcDisplay = nullptr;
         D.width = D.height = 0;
         D.stride = 0;
+        D.slot_mgr.reset();
         D.connected = false;
         D.hwc_id = 0;
         D.active_rwb.reset();
