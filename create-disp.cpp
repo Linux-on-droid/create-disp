@@ -520,6 +520,63 @@ struct drm_evdi_create_buff_callabck {
 	uint32_t stride;
 };
 
+struct QueuedEvdiEvent {
+    poll_event_type event;
+    int poll_id;
+    uint8_t data[32];
+};
+
+template <typename T, size_t Capacity>
+class SpscRingBuffer {
+    static_assert((Capacity != 0) && ((Capacity & (Capacity - 1)) == 0), "Capacity must be power of 2");
+private:
+    struct alignas(64) {
+        std::atomic<size_t> head{0};
+        size_t cached_tail{0};
+    } producer;
+
+    struct alignas(64) {
+        std::atomic<size_t> tail{0};
+        size_t cached_head{0};
+    } consumer;
+
+    T buffer[Capacity];
+
+public:
+    bool push(const T& item) {
+        size_t h = producer.head.load(std::memory_order_relaxed);
+        size_t next = (h + 1) & (Capacity - 1);
+        if (next == producer.cached_tail) {
+            producer.cached_tail = consumer.tail.load(std::memory_order_acquire);
+            if (next == producer.cached_tail) return false;
+        }
+        buffer[h] = item;
+        producer.head.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& item) {
+        size_t t = consumer.tail.load(std::memory_order_relaxed);
+        if (t == consumer.cached_head) {
+            consumer.cached_head = producer.head.load(std::memory_order_acquire);
+            if (t == consumer.cached_head) return false;
+        }
+        item = buffer[t];
+        consumer.tail.store((t + 1) & (Capacity - 1), std::memory_order_release);
+        return true;
+    }
+
+    bool empty() const {
+        return producer.head.load(std::memory_order_acquire) == consumer.tail.load(std::memory_order_relaxed);
+    }
+};
+
+static SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
+static std::atomic<bool> g_evdi_event_thread_sleeping{false};
+static std::mutex g_evdi_event_mutex;
+static std::condition_variable g_evdi_event_cv;
+static std::thread g_evdi_event_thread;
+
 static inline int evdi_vsync(int drv_display_id)
 {
     struct drm_evdi_vsync cmd = {};
@@ -1342,6 +1399,40 @@ static void update_thread_main()
     }
 }
 
+static void evdi_event_thread_main()
+{
+    while (g_running.load(std::memory_order_acquire)) {
+        QueuedEvdiEvent ev;
+
+        if (g_evdi_event_queue.pop(ev)) {
+            switch (ev.event) {
+            case get_buf:
+                get_buf_from_map(ev.data, ev.poll_id);
+                break;
+            case swap_to:
+                swap_to_buff(ev.data, ev.poll_id);
+                break;
+            case destroy_buf:
+                destroy_buff(ev.data, ev.poll_id);
+                break;
+            case create_buf:
+                create_buff(ev.data, ev.poll_id);
+                break;
+            default:
+                break;
+            }
+        } else {
+            std::unique_lock<std::mutex> lk(g_evdi_event_mutex);
+            if (!g_evdi_event_queue.empty()) {
+                continue;
+            }
+            g_evdi_event_thread_sleeping.store(true, std::memory_order_release);
+            g_evdi_event_cv.wait(lk, []{ return !g_running.load(std::memory_order_acquire) || !g_evdi_event_queue.empty(); });
+            g_evdi_event_thread_sleeping.store(false, std::memory_order_release);
+        }
+    }
+}
+
 static void poll_thread_main()
 {
     int hard_poll_failures = 0;
@@ -1417,21 +1508,19 @@ static void poll_thread_main()
 
         hard_poll_failures = 0;
 
-        switch (poll_cmd.event) {
-        case get_buf:
-            get_buf_from_map(poll_cmd.data, poll_cmd.poll_id);
-            break;
-        case swap_to:
-            swap_to_buff(poll_cmd.data, poll_cmd.poll_id);
-            break;
-        case destroy_buf:
-            destroy_buff(poll_cmd.data, poll_cmd.poll_id);
-            break;
-        case create_buf:
-            create_buff(poll_cmd.data, poll_cmd.poll_id);
-            break;
-        default:
-            break;
+        if (poll_cmd.event != none) {
+            QueuedEvdiEvent q_ev;
+            q_ev.event = poll_cmd.event;
+            q_ev.poll_id = poll_cmd.poll_id;
+            std::memcpy(q_ev.data, poll_payload, sizeof(poll_payload));
+
+            if (!g_evdi_event_queue.push(q_ev)) {
+                fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");
+            }
+
+            if (g_evdi_event_thread_sleeping.load(std::memory_order_acquire)) {
+                g_evdi_event_cv.notify_one();
+            }
         }
     }
 }
@@ -1442,6 +1531,7 @@ static void handle_signal(int signo)
     g_running.store(false, std::memory_order_release);
     g_update_cv.notify_all();
     g_present_cv.notify_all();
+    g_evdi_event_cv.notify_all();
 }
 
 static void kick_thread_out_of_ioctl(std::thread& t)
@@ -1523,6 +1613,16 @@ int main() {
         return EXIT_FAILURE;
     }
 
+    // Start EVDI worker thread
+    try {
+        g_evdi_event_thread = std::thread(evdi_event_thread_main);
+    } catch (...) {
+        fprintf(stderr, "Failed to create evdi event thread\n");
+        g_running.store(false, std::memory_order_release);
+        close(drm_fd);
+        return EXIT_FAILURE;
+    }
+
     // Start poll thread
     try {
         g_poll_thread = std::thread(poll_thread_main);
@@ -1539,6 +1639,7 @@ int main() {
 
     g_update_cv.notify_all();
     g_present_cv.notify_all();
+    g_evdi_event_cv.notify_all();
 
     if (g_poll_thread.joinable())
         kick_thread_out_of_ioctl(g_poll_thread);
@@ -1547,6 +1648,11 @@ int main() {
     sd_notify(0, "STATUS=Stopping poll thread…");
     if (g_poll_thread.joinable())
         g_poll_thread.join();
+
+    sd_notify(0, "STATUS=Stopping evdi event thread…");
+    g_evdi_event_cv.notify_all();
+    if (g_evdi_event_thread.joinable())
+        g_evdi_event_thread.join();
 
     sd_notify(0, "STATUS=Stopping present thread…");
     g_present_cv.notify_all();
