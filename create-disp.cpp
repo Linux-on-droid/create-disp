@@ -341,6 +341,7 @@ static constexpr int kRwbUsage =
 	GRALLOC_USAGE_HW_COMPOSER;
 
 struct DisplayRuntimeSnapshot {
+    long long hwc_id = 0;
     hwc2_compat_display_t* hwcDisplay = nullptr;
     int width = 0;
     int height = 0;
@@ -351,6 +352,7 @@ struct DisplayRuntimeSnapshot {
 
 struct alignas(64) DisplayRuntime {
     std::atomic<uint64_t> seq{0};
+    std::atomic<long long> hwc_id{0};
     std::atomic<uintptr_t> hwcDisplay{0};
     std::atomic<int> width{0};
     std::atomic<int> height{0};
@@ -380,6 +382,7 @@ static inline void publish_display_runtime_locked(int display_id)
 
     uint64_t seq = R.seq.load(std::memory_order_relaxed);
     R.seq.store(seq + 1, std::memory_order_release);
+    R.hwc_id.store(D.hwc_id, std::memory_order_relaxed);
     R.hwcDisplay.store(reinterpret_cast<uintptr_t>(D.hwcDisplay), std::memory_order_relaxed);
     R.width.store(D.width, std::memory_order_relaxed);
     R.height.store(D.height, std::memory_order_relaxed);
@@ -403,6 +406,7 @@ static inline DisplayRuntimeSnapshot snapshot_display_runtime_atomic(int display
             continue;
         }
 
+        s.hwc_id = R.hwc_id.load(std::memory_order_relaxed);
         s.hwcDisplay = reinterpret_cast<hwc2_compat_display_t*>(
             R.hwcDisplay.load(std::memory_order_relaxed));
         s.width = R.width.load(std::memory_order_relaxed);
@@ -430,6 +434,22 @@ static inline void request_display_resync(int drv_display_id)
         return;
 
     schedule_update(drv_display_id);
+}
+
+static inline int drv_id_for_hwc_atomic(long long hwc_id)
+{
+    if (hwc_id == 0)
+        return -1;
+
+    for (int d = 0; d < kMaxDriverDisplays; ++d) {
+        DisplayRuntimeSnapshot s = snapshot_display_runtime_atomic(d);
+        if (!s.connected)
+            continue;
+        if (s.hwc_id == hwc_id)
+            return d;
+    }
+
+    return -1;
 }
 
 enum class BufferOrigin : uint8_t {
@@ -1236,8 +1256,9 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId,
                      hwc2_display_t display, int64_t timestamp)
 {
     const long long hwc_id = (long long)display;
-    int drv_id = -1;
-    {
+    int drv_id = drv_id_for_hwc_atomic(hwc_id);
+
+    if (drv_id < 0) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         drv_id = drv_id_for_hwc(hwc_id);
     }
@@ -1345,8 +1366,9 @@ void onRefreshReceived(HWC2EventListener* listener,
                        int32_t sequenceId, hwc2_display_t display)
 {
     const long long hwc_id = (long long)display;
-    int drv_id = -1;
-    {
+    int drv_id = drv_id_for_hwc_atomic(hwc_id);
+
+    if (drv_id < 0) {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         drv_id = drv_id_for_hwc(hwc_id);
     }
