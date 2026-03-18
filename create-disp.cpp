@@ -6,6 +6,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 #include <cerrno>
 #include <xf86drm.h>
 #include <memory>
@@ -94,19 +95,23 @@ static std::shared_mutex g_drm_mutex;
 
 static std::mutex g_update_mutex;
 static std::condition_variable g_update_cv;
-static std::deque<int> g_work_queue;
-static bool g_pending_update[kMaxDriverDisplays] = {};
-static bool g_pending_disconnect[kMaxDriverDisplays] = {};
-static bool g_enqueued[kMaxDriverDisplays] = {};
+enum : uint8_t {
+    kUpdateWorkNone       = 0,
+    kUpdateWorkRefresh    = 1u << 0,
+    kUpdateWorkDisconnect = 1u << 1,
+};
+static std::array<std::atomic<uint8_t>, kMaxDriverDisplays> g_update_work = {};
+static std::atomic<uint32_t> g_update_pending_mask{0};
+static std::atomic<int> g_update_rr{0};
 static std::thread g_update_thread;
 
 static std::atomic<bool> g_reopen_requested{false};
 static std::atomic<int> g_modeset_inflight{0};
 
-static std::mutex g_present_mutex;
-static std::condition_variable g_present_cv;
-static std::deque<struct PresentJob> g_present_q;
 static std::thread g_present_thread;
+static std::atomic<uint32_t> g_present_ready_mask{0};
+static std::atomic<int> g_present_rr{0};
+static int g_present_event_fd = -1;
 
 static constexpr int kShutdownKickSignal = SIGUSR1;
 
@@ -159,51 +164,61 @@ static inline bool should_request_reopen(int err)
            g_modeset_inflight.load(std::memory_order_acquire) == 0;
 }
 
-static inline void clear_pending_work_locked(int drv_display_id)
+static inline void clear_pending_work_atomic(int drv_display_id)
 {
     if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
         return;
-    g_pending_update[drv_display_id] = false;
-    g_pending_disconnect[drv_display_id] = false;
-    g_enqueued[drv_display_id] = false;
-    for (auto it = g_work_queue.begin(); it != g_work_queue.end(); ) {
-        if (*it == drv_display_id)
-            it = g_work_queue.erase(it);
-        else
-            ++it;
-    }
+
+    g_update_work[drv_display_id].store(kUpdateWorkNone, std::memory_order_release);
+    g_update_pending_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
+                                    std::memory_order_acq_rel);
 }
 
 static inline void request_display_resync(int drv_display_id);
+static inline void publish_update_work(int drv_display_id, uint8_t work_bits)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return;
+
+    g_update_work[drv_display_id].fetch_or(work_bits, std::memory_order_acq_rel);
+    g_update_pending_mask.fetch_or(uint32_t(1) << uint32_t(drv_display_id),
+                                   std::memory_order_acq_rel);
+    g_update_cv.notify_one();
+}
+
 static inline void schedule_update(int drv_display_id)
 {
-    {
-        std::lock_guard<std::mutex> lk(g_update_mutex);
-        if (drv_display_id >= 0 && drv_display_id < kMaxDriverDisplays) {
-            g_pending_update[drv_display_id] = true;
-            if (!g_enqueued[drv_display_id]) {
-                g_work_queue.push_back(drv_display_id);
-                g_enqueued[drv_display_id] = true;
-            }
-        }
-    }
-    g_update_cv.notify_one();
+    publish_update_work(drv_display_id, kUpdateWorkRefresh);
 }
 
 static inline void schedule_disconnect(int drv_display_id)
 {
-    {
-        std::lock_guard<std::mutex> lk(g_update_mutex);
-        if (drv_display_id >= 0 && drv_display_id < kMaxDriverDisplays) {
-            g_pending_disconnect[drv_display_id] = true;
-            g_pending_update[drv_display_id] = false;
-            if (!g_enqueued[drv_display_id]) {
-                g_work_queue.push_back(drv_display_id);
-                g_enqueued[drv_display_id] = true;
-            }
+    publish_update_work(drv_display_id, kUpdateWorkDisconnect);
+}
+
+static inline bool take_next_update_display(int& out_drv_display_id)
+{
+    const uint32_t mask = g_update_pending_mask.load(std::memory_order_acquire);
+    if (mask == 0)
+        return false;
+
+    const int start = g_update_rr.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < kMaxDriverDisplays; ++i) {
+        const int d = (start + i) % kMaxDriverDisplays;
+        const uint32_t bit = uint32_t(1) << uint32_t(d);
+
+        if ((mask & bit) == 0)
+            continue;
+
+        const uint32_t prev =
+            g_update_pending_mask.fetch_and(~bit, std::memory_order_acq_rel);
+        if (prev & bit) {
+            out_drv_display_id = d;
+            return true;
         }
     }
-    g_update_cv.notify_one();
+
+    return false;
 }
 
 namespace {
@@ -325,13 +340,23 @@ static constexpr int kRwbUsage =
 	GRALLOC_USAGE_HW_RENDER |
 	GRALLOC_USAGE_HW_COMPOSER;
 
-struct DisplaySnapshot {
+struct DisplayRuntimeSnapshot {
     hwc2_compat_display_t* hwcDisplay = nullptr;
     int width = 0;
     int height = 0;
     uint32_t stride = 0;
     bool connected = false;
     uint64_t generation = 0;
+};
+
+struct alignas(64) DisplayRuntime {
+    std::atomic<uint64_t> seq{0};
+    std::atomic<uintptr_t> hwcDisplay{0};
+    std::atomic<int> width{0};
+    std::atomic<int> height{0};
+    std::atomic<uint32_t> stride{0};
+    std::atomic<bool> connected{false};
+    std::atomic<uint64_t> generation{0};
 };
 
 static inline Display& get_or_create_display(int display_id) {
@@ -343,17 +368,53 @@ static inline Display& get_or_create_display(int display_id) {
     return ins_it->second;
 }
 
-static inline DisplaySnapshot snapshot_display_locked(int display_id)
+static std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;
+
+static inline void publish_display_runtime_locked(int display_id)
 {
+    if (display_id < 0 || display_id >= kMaxDriverDisplays)
+        return;
+
     Display& D = get_or_create_display(display_id);
-    DisplaySnapshot s;
-    s.hwcDisplay = D.hwcDisplay;
-    s.width = D.width;
-    s.height = D.height;
-    s.stride = D.stride;
-    s.connected = D.connected;
-    s.generation = D.generation;
-    return s;
+    DisplayRuntime& R = g_display_runtime[display_id];
+
+    uint64_t seq = R.seq.load(std::memory_order_relaxed);
+    R.seq.store(seq + 1, std::memory_order_release);
+    R.hwcDisplay.store(reinterpret_cast<uintptr_t>(D.hwcDisplay), std::memory_order_relaxed);
+    R.width.store(D.width, std::memory_order_relaxed);
+    R.height.store(D.height, std::memory_order_relaxed);
+    R.stride.store(D.stride, std::memory_order_relaxed);
+    R.connected.store(D.connected, std::memory_order_relaxed);
+    R.generation.store(D.generation, std::memory_order_relaxed);
+    R.seq.store(seq + 2, std::memory_order_release);
+}
+
+static inline DisplayRuntimeSnapshot snapshot_display_runtime_atomic(int display_id)
+{
+    DisplayRuntimeSnapshot s;
+    if (display_id < 0 || display_id >= kMaxDriverDisplays)
+        return s;
+
+    DisplayRuntime& R = g_display_runtime[display_id];
+    for (;;) {
+        uint64_t seq1 = R.seq.load(std::memory_order_acquire);
+        if (seq1 & 1ULL) {
+            std::this_thread::yield();
+            continue;
+        }
+
+        s.hwcDisplay = reinterpret_cast<hwc2_compat_display_t*>(
+            R.hwcDisplay.load(std::memory_order_relaxed));
+        s.width = R.width.load(std::memory_order_relaxed);
+        s.height = R.height.load(std::memory_order_relaxed);
+        s.stride = R.stride.load(std::memory_order_relaxed);
+        s.connected = R.connected.load(std::memory_order_relaxed);
+        s.generation = R.generation.load(std::memory_order_relaxed);
+
+        uint64_t seq2 = R.seq.load(std::memory_order_acquire);
+        if (likely(seq1 == seq2))
+            return s;
+    }
 }
 
 hwc2_compat_device_t* hwcDevice;
@@ -382,16 +443,17 @@ struct BufferEntry {
     // created first swap_to:
     SharedRwb rwb;
     // Track geometry used to build rwb so we can detect mismatch
-    int rwb_w = 0;
-    int rwb_h = 0;
-    uint32_t rwb_stride = 0;
-    int rwb_format = 0;
+    std::atomic<int> rwb_w{0};
+    std::atomic<int> rwb_h{0};
+    std::atomic<uint32_t> rwb_stride{0};
+    std::atomic<int> rwb_format{0};
     int format = 0;
     uint32_t stride = 0;
     int width = 0;
     int height = 0;
-    int display_id = -1;
-    uint64_t generation = 0;
+    std::atomic<int> bound_display_id{-1};
+    std::atomic<uint64_t> bound_generation{0};
+    std::atomic<uint32_t> bound_slot{UINT32_MAX};
 
     ~BufferEntry() {
         rwb.reset();
@@ -424,8 +486,9 @@ static inline void reset_buffer_binding_locked(const std::shared_ptr<BufferEntry
     if (!entry)
         return;
 
-    entry->display_id = -1;
-    entry->generation = 0;
+    entry->bound_display_id.store(-1, std::memory_order_relaxed);
+    entry->bound_generation.store(0, std::memory_order_relaxed);
+    entry->bound_slot.store(UINT32_MAX, std::memory_order_relaxed);
 }
 
 static inline void reset_display_bindings_locked(int drv_display_id)
@@ -444,7 +507,8 @@ static inline void reset_display_bindings_locked(int drv_display_id)
         auto it = g_buffers.find(buf_id);
         if (it != g_buffers.end()) {
             const std::shared_ptr<BufferEntry>& entry = it->second;
-            if (entry && entry->display_id == drv_display_id)
+            if (entry &&
+                entry->bound_display_id.load(std::memory_order_relaxed) == drv_display_id)
                 reset_buffer_binding_locked(entry);
         }
     }
@@ -630,97 +694,426 @@ struct PresentJob {
     SharedRwb rwb;
 };
 
+static inline SharedRwb load_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry)
+{
+    return std::atomic_load(&entry->rwb);
+}
+
+static inline void store_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry,
+                                          const SharedRwb& rwb)
+{
+    std::atomic_store(&entry->rwb, rwb);
+}
+
+static inline void get_entry_buffer_geometry(const std::shared_ptr<BufferEntry>& entry,
+                                             const DisplayRuntimeSnapshot& dsnap,
+                                             uint32_t& buf_stride,
+                                             int& buf_w,
+                                             int& buf_h,
+                                             int& buf_format)
+{
+    buf_format = entry->format;
+    buf_stride = entry->stride;
+
+    if (entry->origin == BufferOrigin::Imported) {
+        buf_w = entry->width;
+        buf_h = entry->height;
+    } else {
+        buf_w = entry->width ? entry->width : dsnap.width;
+        buf_h = entry->height ? entry->height : dsnap.height;
+    }
+}
+
+static inline bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry,
+                                           int buf_w,
+                                            int buf_h,
+                                            uint32_t buf_stride,
+                                            int buf_format,
+                                            SharedRwb& out_rwb)
+{
+    out_rwb = load_entry_rwb_atomic(entry);
+    if (!out_rwb)
+        return false;
+
+    return entry->rwb_w.load(std::memory_order_acquire) == buf_w &&
+           entry->rwb_h.load(std::memory_order_acquire) == buf_h &&
+           entry->rwb_stride.load(std::memory_order_acquire) == buf_stride &&
+           entry->rwb_format.load(std::memory_order_acquire) == buf_format;
+}
+
+static inline bool prepare_present_job_fast(int id,
+                                            int drv_display_id,
+                                            const std::shared_ptr<BufferEntry>& entry,
+                                           PresentJob& out)
+{
+    DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(drv_display_id);
+    if (unlikely(!dsnap.hwcDisplay || !dsnap.connected ||
+                 dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0)) {
+        request_display_resync(drv_display_id);
+        return false;
+    }
+
+    const int bound_display =
+        entry->bound_display_id.load(std::memory_order_acquire);
+    const uint64_t bound_generation =
+       entry->bound_generation.load(std::memory_order_acquire);
+    const uint32_t bound_slot =
+        entry->bound_slot.load(std::memory_order_acquire);
+
+    if (bound_display != drv_display_id ||
+        bound_generation != dsnap.generation ||
+        bound_slot == UINT32_MAX)
+        return false;
+
+    uint32_t buf_stride = 0;
+    int buf_w = 0;
+    int buf_h = 0;
+   int buf_format = 0;
+    get_entry_buffer_geometry(entry, dsnap, buf_stride, buf_w, buf_h, buf_format);
+
+    if (unlikely(buf_stride == 0 || buf_w <= 0 || buf_h <= 0)) {
+        fprintf(stderr,
+                "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
+                id, (int)entry->origin, buf_w, buf_h, buf_stride);
+       request_display_resync(drv_display_id);
+        return false;
+    }
+
+    SharedRwb rwb;
+    if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb))
+        return false;
+
+    out.drv_display_id = drv_display_id;
+    out.buf_id = id;
+    out.generation = dsnap.generation;
+    out.slot = bound_slot;
+    out.entry = entry;
+    out.rwb = std::move(rwb);
+    return true;
+}
+
+static inline bool prepare_present_job_slow(int id,
+                                            int drv_display_id,
+                                            const std::shared_ptr<BufferEntry>& entry,
+                                            PresentJob& out)
+{
+    DisplayRuntimeSnapshot dsnap;
+    uint32_t slot = UINT32_MAX;
+    uint32_t buf_stride = 0;
+    int buf_w = 0;
+    int buf_h = 0;
+    int buf_format = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_state_mutex);
+
+        if (get_entry_locked_nolock(id) != entry || !entry->handle) {
+            request_display_resync(drv_display_id);
+            return false;
+        }
+
+        Display& D = get_or_create_display(drv_display_id);
+        dsnap.hwcDisplay = D.hwcDisplay;
+        dsnap.width = D.width;
+        dsnap.height = D.height;
+        dsnap.stride = D.stride;
+        dsnap.connected = D.connected;
+        dsnap.generation = D.generation;
+
+        if (unlikely(!dsnap.hwcDisplay || !dsnap.connected ||
+                     dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0)) {
+            request_display_resync(drv_display_id);
+            return false;
+        }
+
+        const int bound_display =
+            entry->bound_display_id.load(std::memory_order_relaxed);
+        const uint64_t bound_generation =
+            entry->bound_generation.load(std::memory_order_relaxed);
+
+        if (bound_generation != 0 && bound_generation != dsnap.generation) {
+            request_display_resync(drv_display_id);
+            return false;
+        }
+
+        if (bound_display >= 0 &&
+            bound_display != drv_display_id &&
+            bound_generation == dsnap.generation) {
+            request_display_resync(drv_display_id);
+            return false;
+        }
+
+        if (bound_display != drv_display_id || bound_generation != dsnap.generation) {
+            if ((entry->width  != 0 && entry->width  != dsnap.width) ||
+                (entry->height != 0 && entry->height != dsnap.height)) {
+                fprintf(stderr,
+                        "Dropping stale/mismatched buffer id=%d for display=%d "
+                        "(buf=%dx%d, display=%dx%d)\n",
+                        id, drv_display_id,
+                        entry->width, entry->height,
+                        dsnap.width, dsnap.height);
+                request_display_resync(drv_display_id);
+                return false;
+            }
+           reset_buffer_binding_locked(entry);
+            entry->bound_display_id.store(drv_display_id, std::memory_order_relaxed);
+            entry->bound_generation.store(dsnap.generation, std::memory_order_relaxed);
+        }
+
+        slot = D.slot_mgr.assign(id);
+        if (slot == UINT32_MAX) {
+            fprintf(stderr,
+                    "SlotManager: failed to assign slot for bufid %d on display %d\n",
+                    id, drv_display_id);
+            return false;
+        }
+
+        entry->bound_slot.store(slot, std::memory_order_relaxed);
+        get_entry_buffer_geometry(entry, dsnap, buf_stride, buf_w, buf_h, buf_format);
+    }
+
+    if (unlikely(buf_stride == 0 || buf_w <= 0 || buf_h <= 0)) {
+        fprintf(stderr,
+                "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
+                id, (int)entry->origin, buf_w, buf_h, buf_stride);
+        request_display_resync(drv_display_id);
+        return false;
+    }
+
+    SharedRwb rwb;
+    if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb)) {
+        SharedRwb new_rwb = make_rwb(buf_w, buf_h, buf_stride, buf_format,
+                                     kRwbUsage, entry->handle);
+        if (unlikely(!new_rwb)) {
+            fprintf(stderr, "Failed to allocate RemoteWindowBuffer for id=%d\n", id);
+            return false;
+        }
+
+        if (entry->bound_display_id.load(std::memory_order_acquire) != drv_display_id ||
+            entry->bound_generation.load(std::memory_order_acquire) != dsnap.generation ||
+            entry->bound_slot.load(std::memory_order_acquire) != slot) {
+            return false;
+        }
+
+        store_entry_rwb_atomic(entry, new_rwb);
+        entry->rwb_w.store(buf_w, std::memory_order_release);
+        entry->rwb_h.store(buf_h, std::memory_order_release);
+        entry->rwb_stride.store(buf_stride, std::memory_order_release);
+        entry->rwb_format.store(buf_format, std::memory_order_release);
+        rwb = std::move(new_rwb);
+    }
+
+    out.drv_display_id = drv_display_id;
+    out.buf_id = id;
+    out.generation = dsnap.generation;
+    out.slot = slot;
+    out.entry = entry;
+    out.rwb = std::move(rwb);
+    return true;
+}
+
+struct alignas(64) PresentMailbox {
+    std::atomic<bool> pending{false};
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+    PresentJob job;
+};
+
+static std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
+
+static inline void notify_present_thread()
+{
+    if (g_present_event_fd < 0)
+        return;
+
+    const uint64_t one = 1;
+    ssize_t rc;
+    do {
+        rc = ::write(g_present_event_fd, &one, sizeof(one));
+    } while (rc < 0 && errno == EINTR);
+}
+
+static inline void wait_for_present_work()
+{
+    if (g_present_event_fd < 0)
+        return;
+
+    uint64_t cnt = 0;
+    for (;;) {
+        ssize_t rc = ::read(g_present_event_fd, &cnt, sizeof(cnt));
+        if (rc == (ssize_t)sizeof(cnt))
+            return;
+        if (rc < 0 && errno == EINTR) {
+            if (!g_running.load(std::memory_order_acquire))
+                return;
+            continue;
+        }
+        return;
+    }
+}
+
+static inline void lock_present_mailbox(int drv_display_id)
+{
+    PresentMailbox& m = g_present_mailboxes[drv_display_id];
+    while (m.lock.test_and_set(std::memory_order_acquire))
+        std::this_thread::yield();
+}
+
+static inline void unlock_present_mailbox(int drv_display_id)
+{
+    g_present_mailboxes[drv_display_id].lock.clear(std::memory_order_release);
+}
+
+static inline bool take_next_present_display(int& out_drv_display_id)
+{
+    const uint32_t mask = g_present_ready_mask.load(std::memory_order_acquire);
+    if (mask == 0)
+        return false;
+
+    const int start = g_present_rr.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < kMaxDriverDisplays; ++i) {
+        const int d = (start + i) % kMaxDriverDisplays;
+        const uint32_t bit = uint32_t(1) << uint32_t(d);
+
+        if ((mask & bit) == 0)
+            continue;
+
+        const uint32_t prev =
+            g_present_ready_mask.fetch_and(~bit, std::memory_order_acq_rel);
+        if (prev & bit) {
+            out_drv_display_id = d;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static inline bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
+{
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return false;
+
+    PresentMailbox& m = g_present_mailboxes[drv_display_id];
+    if (!m.pending.load(std::memory_order_acquire))
+        return false;
+
+    if (m.lock.test_and_set(std::memory_order_acquire))
+        return false;
+
+    if (!m.pending.load(std::memory_order_acquire)) {
+        m.lock.clear(std::memory_order_release);
+        return false;
+    }
+
+    out = std::move(m.job);
+    m.job = PresentJob{};
+    m.pending.store(false, std::memory_order_release);
+    m.lock.clear(std::memory_order_release);
+    return true;
+}
+
 static inline void enqueue_present_job(PresentJob&& j)
 {
-    {
-        std::lock_guard<std::mutex> lk(g_present_mutex);
-        for (auto it = g_present_q.begin(); it != g_present_q.end(); ) {
-            if (it->drv_display_id == j.drv_display_id)
-                it = g_present_q.erase(it);
-            else
-                ++it;
-        }
-        g_present_q.push_back(std::move(j));
-    }
-    g_present_cv.notify_one();
+    if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays)
+        return;
+
+    const int d = j.drv_display_id;
+    lock_present_mailbox(d);
+    PresentMailbox& m = g_present_mailboxes[d];
+    m.job = std::move(j);
+    m.pending.store(true, std::memory_order_release);
+    unlock_present_mailbox(d);
+
+    const uint32_t bit = uint32_t(1) << uint32_t(d);
+    const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_acq_rel);
+    if ((prev & bit) == 0)
+        notify_present_thread();
 }
 
 static inline void flush_present_jobs_for_display(int drv_display_id)
 {
-    std::lock_guard<std::mutex> lk(g_present_mutex);
-    for (auto it = g_present_q.begin(); it != g_present_q.end(); ) {
-        if (it->drv_display_id == drv_display_id)
-            it = g_present_q.erase(it);
-        else
-            ++it;
-    }
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return;
+
+    lock_present_mailbox(drv_display_id);
+    PresentMailbox& m = g_present_mailboxes[drv_display_id];
+    m.job = PresentJob{};
+    m.pending.store(false, std::memory_order_release);
+    unlock_present_mailbox(drv_display_id);
+
+    g_present_ready_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
+                                   std::memory_order_acq_rel);
 }
 
 static void present_thread_main()
 {
     while (g_running.load(std::memory_order_acquire)) {
-        PresentJob j;
-        {
-            std::unique_lock<std::mutex> lk(g_present_mutex);
-            g_present_cv.wait(lk, []{
-                return !g_running.load(std::memory_order_acquire) || !g_present_q.empty();
-            });
-            if (!g_running.load(std::memory_order_acquire))
-                break;
-            j = std::move(g_present_q.front());
-            g_present_q.pop_front();
-        }
+        bool did_work = false;
+        int d = -1;
 
-        if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays || !j.rwb)
-            continue;
-
-        hwc2_compat_display_t* hwcDisp = nullptr;
-        {
-            std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
-            std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id], std::defer_lock);
-            std::lock(state_lk, hwc_lk);
-
-            Display& D = get_or_create_display(j.drv_display_id);
-            hwcDisp = D.hwcDisplay;
-            if (!D.connected || !hwcDisp || D.generation != j.generation)
+        while (take_next_present_display(d)) {
+            PresentJob j;
+            if (!try_dequeue_present_job(d, j))
                 continue;
 
-            state_lk.unlock();
-            uint32_t numTypes = 0, numRequests = 0;
-            hwc2_error_t err = HWC2_ERROR_NONE;
+            did_work = true;
 
-            err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
-                                                        -1, HAL_DATASPACE_UNKNOWN);
-            if (err != HWC2_ERROR_NONE) {
-                fprintf(stderr, "set_client_target failed: %d\n", (int)err);
-                request_display_resync(j.drv_display_id);
+            if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays || !j.rwb)
                 continue;
+
+            hwc2_compat_display_t* hwcDisp = nullptr;
+            {
+                std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
+                std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id], std::defer_lock);
+                std::lock(state_lk, hwc_lk);
+
+                Display& D = get_or_create_display(j.drv_display_id);
+                hwcDisp = D.hwcDisplay;
+                if (!D.connected || !hwcDisp || D.generation != j.generation)
+                    continue;
+
+                state_lk.unlock();
+                uint32_t numTypes = 0, numRequests = 0;
+                hwc2_error_t err = HWC2_ERROR_NONE;
+
+                err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
+                                                            -1, HAL_DATASPACE_UNKNOWN);
+                if (err != HWC2_ERROR_NONE) {
+                    fprintf(stderr, "set_client_target failed: %d\n", (int)err);
+                    request_display_resync(j.drv_display_id);
+                    continue;
+                }
+
+                err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
+                if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests))
+                    (void)hwc2_compat_display_accept_changes(hwcDisp);
+                else if (err != HWC2_ERROR_NONE) {
+                    fprintf(stderr, "validate failed: %d\n", (int)err);
+                    request_display_resync(j.drv_display_id);
+                    continue;
+                }
+
+                int presentFence = -1;
+                err = hwc2_compat_display_present(hwcDisp, &presentFence);
+                if (err != HWC2_ERROR_NONE) {
+                    fprintf(stderr, "present failed: %d\n", (int)err);
+                    request_display_resync(j.drv_display_id);
+                    continue;
+                }
             }
-
-            err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
-            if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests))
-                (void)hwc2_compat_display_accept_changes(hwcDisp);
-            else if (err != HWC2_ERROR_NONE) {
-                fprintf(stderr, "validate failed: %d\n", (int)err);
-                request_display_resync(j.drv_display_id);
-                continue;
-            }
-
-            int presentFence = -1;
-            err = hwc2_compat_display_present(hwcDisp, &presentFence);
-            if (err != HWC2_ERROR_NONE) {
-                fprintf(stderr, "present failed: %d\n", (int)err);
-                request_display_resync(j.drv_display_id);
-                continue;
+            {
+                std::lock_guard<std::mutex> state_lk(g_state_mutex);
+                Display& D = get_or_create_display(j.drv_display_id);
+                if (!D.connected || !D.hwcDisplay || D.generation != j.generation)
+                    continue;
+                g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
             }
         }
-        {
-            std::lock_guard<std::mutex> state_lk(g_state_mutex);
-            Display& D = get_or_create_display(j.drv_display_id);
-            if (!D.connected || !D.hwcDisplay || D.generation != j.generation)
-                continue;
-            g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
-        }
+        if (!g_running.load(std::memory_order_acquire))
+            break;
+
+        if (!did_work)
+            wait_for_present_work();
     }
 }
 
@@ -925,6 +1318,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
                 D.hwc_id = hwc_id;
                 D.hwcDisplay = hwc_display;
                 D.connected = true;
+                publish_display_runtime_locked(drv_id);
             }
             schedule_update(drv_id);
             if (hwc_display)
@@ -941,6 +1335,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId,
                 std::lock(state_lk, hwc_lk);
                 Display& D = get_or_create_display(drv_id);
                 D.connected = false;
+                publish_display_runtime_locked(drv_id);
             }
             schedule_disconnect(drv_id);
         }
@@ -1009,130 +1404,23 @@ void swap_to_buff(void *data, int poll_id) {
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
 
-    hwc2_compat_display_t* hwcDisp = nullptr;
-    DisplaySnapshot Dsnap;
     std::shared_ptr<BufferEntry> entry;
-    SharedRwb rwb;
-    uint32_t slot = 0;
-    uint32_t buf_stride = 0;
-    int buf_w = 0;
-    int buf_h = 0;
-    int buf_format = 0;
 
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         entry = get_entry_locked_nolock(id);
-        if (!entry || !entry->handle) {
-            request_display_resync(drv_display_id);
-            return;
-        }
-
-        Dsnap = snapshot_display_locked(drv_display_id);
-        hwcDisp = Dsnap.hwcDisplay;
-
-        if (unlikely(!hwcDisp || !Dsnap.connected || Dsnap.width == 0 || Dsnap.height == 0 || Dsnap.stride == 0)) {
-            request_display_resync(drv_display_id);
-            return;
-        }
-
-        Display& D = get_or_create_display(drv_display_id);
-
-        if (!D.connected || !D.hwcDisplay || D.generation != Dsnap.generation) {
-            request_display_resync(drv_display_id);
-            return;
-        }
-
-        if (entry->generation != 0 && entry->generation != Dsnap.generation) {
-            request_display_resync(drv_display_id);
-            return;
-        }
-
-        if (entry->display_id >= 0 &&
-            entry->display_id != drv_display_id &&
-            entry->generation == Dsnap.generation) {
-            request_display_resync(drv_display_id);
-            return;
-        }
-
-        if (entry->display_id != drv_display_id || entry->generation != Dsnap.generation) {
-            if ((entry->width  != 0 && entry->width  != Dsnap.width) ||
-                (entry->height != 0 && entry->height != Dsnap.height)) {
-                fprintf(stderr,
-                        "Dropping stale/mismatched buffer id=%d for display=%d "
-                        "(buf=%dx%d, display=%dx%d)\n",
-                        id, drv_display_id,
-                        entry->width, entry->height,
-                        Dsnap.width, Dsnap.height);
-                request_display_resync(drv_display_id);
-                return;
-            }
-            reset_buffer_binding_locked(entry);
-            entry->display_id = drv_display_id;
-            entry->generation = Dsnap.generation;
-        }
-
-        slot = D.slot_mgr.assign(id);
-
-        if (slot == UINT32_MAX) {
-            fprintf(stderr, "SlotManager: failed to assign slot for bufid %d on display %d\n",
-                    id, drv_display_id);
-            return;
-        }
-
-        // Check RWB matches display geometry
-        buf_format = entry->format;
-
-        if (entry->origin == BufferOrigin::Imported) {
-            buf_stride = entry->stride;
-            buf_w = entry->width;
-            buf_h = entry->height;
-        } else {
-            buf_stride = entry->stride;
-            buf_w = entry->width ? entry->width : Dsnap.width;
-            buf_h = entry->height ? entry->height : Dsnap.height;
-        }
-        rwb = entry->rwb;
     }
 
-    if (buf_stride == 0 || buf_w <= 0 || buf_h <= 0) {
-        fprintf(stderr, "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
-                id, (int)entry->origin, buf_w, buf_h, buf_stride);
+    if (!entry || !entry->handle) {
         request_display_resync(drv_display_id);
         return;
     }
 
-    if (!rwb || entry->rwb_w != buf_w || entry->rwb_h != buf_h ||
-        entry->rwb_stride != buf_stride || entry->rwb_format != buf_format) {
-
-        rwb = make_rwb(buf_w, buf_h, buf_stride, buf_format, kRwbUsage, entry->handle);
-
-        if (unlikely(!rwb)) {
-            printf("Failed to allocate RemoteWindowBuffer for id=%d\n", id);
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(g_state_mutex);
-            if (get_entry_locked_nolock(id) == entry) {
-                entry->rwb = rwb;
-                entry->rwb_w = buf_w;
-                entry->rwb_h = buf_h;
-                entry->rwb_stride = buf_stride;
-                entry->rwb_format = buf_format;
-            } else {
-                return;
-            }
-        }
-    }
-
-    // Offload blocking to present thread
     PresentJob j;
-    j.drv_display_id = drv_display_id;
-    j.buf_id = id;
-    j.generation = Dsnap.generation;
-    j.slot = slot;
-    j.entry = std::move(entry);
-    j.rwb = std::move(rwb);
+    if (!prepare_present_job_fast(id, drv_display_id, entry, j) &&
+        !prepare_present_job_slow(id, drv_display_id, entry, j)) {
+        return;
+    }
     enqueue_present_job(std::move(j));
     return;
 }
@@ -1282,6 +1570,7 @@ int update_display(int display_id) {
         D.width = target_width;
         D.height = target_height;
         D.stride = 0;
+        publish_display_runtime_locked(display_id);
     }
     buffer_handle_t handle = nullptr;
     int r = hybris_gralloc_allocate(target_width, target_height, HAL_PIXEL_FORMAT_RGBX_8888,
@@ -1312,6 +1601,7 @@ int update_display(int display_id) {
             D.width = target_width;
             D.height = target_height;
             D.stride = new_stride;
+            publish_display_runtime_locked(display_id);
         }
     }
     return 0;
@@ -1341,11 +1631,9 @@ static void disconnect_display(int drv_id)
         D.stride = 0;
         D.connected = false;
         D.hwc_id = 0;
+        publish_display_runtime_locked(drv_id);
         g_resync_pending[drv_id].store(false, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> ulk(g_update_mutex);
-            clear_pending_work_locked(drv_id);
-        }
+        clear_pending_work_atomic(drv_id);
         if (hwc_id != 0)
             release_driver_slot_for_hwc(hwc_id);
     }
@@ -1360,37 +1648,20 @@ static void update_thread_main()
             std::unique_lock<std::mutex> lk(g_update_mutex);
             g_update_cv.wait(lk, []{
                 return !g_running.load(std::memory_order_acquire) ||
-                       !g_work_queue.empty();
+                       g_update_pending_mask.load(std::memory_order_acquire) != 0;
             });
 
             if (!g_running.load(std::memory_order_acquire))
                 break;
-
-            if (g_work_queue.empty())
-                continue;
-            disp = g_work_queue.front();
-            g_work_queue.pop_front();
-            if (disp >= 0 && disp < kMaxDriverDisplays)
-                g_enqueued[disp] = false;
         }
 
-        if (disp < 0)
+        if (!take_next_update_display(disp))
             continue;
 
-        bool do_disconnect = false;
-        bool do_update = false;
-        {
-            std::lock_guard<std::mutex> lk(g_update_mutex);
-            if (disp >= 0 && disp < kMaxDriverDisplays) {
-                if (g_pending_disconnect[disp]) {
-                    g_pending_disconnect[disp] = false;
-                    do_disconnect = true;
-                } else if (g_pending_update[disp]) {
-                    g_pending_update[disp] = false;
-                    do_update = true;
-                }
-            }
-        }
+        const uint8_t work =
+            g_update_work[disp].exchange(kUpdateWorkNone, std::memory_order_acq_rel);
+        const bool do_disconnect = (work & kUpdateWorkDisconnect) != 0;
+        const bool do_update = (work & kUpdateWorkRefresh) != 0;
 
         if (do_disconnect)
             disconnect_display(disp);
@@ -1473,6 +1744,7 @@ static void poll_thread_main()
                             kv.second.width = 0;
                             kv.second.height = 0;
                             kv.second.stride = 0;
+                            publish_display_runtime_locked(kv.first);
                             g_resync_pending[kv.first].store(true, std::memory_order_release);
                             if (reconnect_count < kMaxDriverDisplays)
                                 reconnect_displays[reconnect_count++] = kv.first;
@@ -1530,8 +1802,8 @@ static void handle_signal(int signo)
     (void)signo;
     g_running.store(false, std::memory_order_release);
     g_update_cv.notify_all();
-    g_present_cv.notify_all();
     g_evdi_event_cv.notify_all();
+    notify_present_thread();
 }
 
 static void kick_thread_out_of_ioctl(std::thread& t)
@@ -1582,9 +1854,19 @@ int main() {
     if (drm_fd < 0) return EXIT_FAILURE;
     drm_ready.store(true, std::memory_order_release);
 
-    hwcDevice = hwc2_compat_device_new(false);
-    if (!hwcDevice)
+    g_present_event_fd = eventfd(0, EFD_CLOEXEC);
+    if (g_present_event_fd < 0) {
+        perror("eventfd");
+        close(drm_fd);
         return EXIT_FAILURE;
+    }
+
+    hwcDevice = hwc2_compat_device_new(false);
+    if (!hwcDevice) {
+        close(g_present_event_fd);
+        g_present_event_fd = -1;
+        return EXIT_FAILURE;
+    }
     assert(hwcDevice);
     hwc2_compat_device_register_callback(hwcDevice, &eventListener,
                                          composerSequenceId);
@@ -1593,6 +1875,8 @@ int main() {
         g_update_thread = std::thread(update_thread_main);
     } catch (...) {
         fprintf(stderr, "Failed to create update thread\n");
+        close(g_present_event_fd);
+        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -1609,6 +1893,8 @@ int main() {
         fprintf(stderr, "Failed to create present thread\n");
         g_running.store(false, std::memory_order_release);
         g_update_cv.notify_all();
+        close(g_present_event_fd);
+        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -1619,6 +1905,9 @@ int main() {
     } catch (...) {
         fprintf(stderr, "Failed to create evdi event thread\n");
         g_running.store(false, std::memory_order_release);
+        notify_present_thread();
+        close(g_present_event_fd);
+        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -1628,6 +1917,19 @@ int main() {
         g_poll_thread = std::thread(poll_thread_main);
     } catch (...) {
         fprintf(stderr, "Failed to create poll thread\n");
+        g_running.store(false, std::memory_order_release);
+        notify_present_thread();
+        g_evdi_event_cv.notify_all();
+        if (g_evdi_event_thread.joinable())
+            g_evdi_event_thread.join();
+        if (g_present_thread.joinable())
+            g_present_thread.join();
+        if (g_update_thread.joinable()) {
+            g_update_cv.notify_all();
+            g_update_thread.join();
+        }
+        close(g_present_event_fd);
+        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -1637,8 +1939,8 @@ int main() {
         pause();
     }
 
+    notify_present_thread();
     g_update_cv.notify_all();
-    g_present_cv.notify_all();
     g_evdi_event_cv.notify_all();
 
     if (g_poll_thread.joinable())
@@ -1655,14 +1957,16 @@ int main() {
         g_evdi_event_thread.join();
 
     sd_notify(0, "STATUS=Stopping present thread…");
-    g_present_cv.notify_all();
-    if (g_present_thread.joinable())
-        kick_thread_out_of_ioctl(g_present_thread);
-
-    drm_shutdown_close_fd();
-
+    notify_present_thread();
     if (g_present_thread.joinable())
         g_present_thread.join();
+
+    if (g_present_event_fd >= 0) {
+        close(g_present_event_fd);
+        g_present_event_fd = -1;
+    }
+
+    drm_shutdown_close_fd();
 
     sd_notify(0, "STATUS=Stopping update thread…");
     g_update_cv.notify_all();
