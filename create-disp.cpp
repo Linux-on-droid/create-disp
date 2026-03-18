@@ -421,6 +421,14 @@ static inline DisplayRuntimeSnapshot snapshot_display_runtime_atomic(int display
     }
 }
 
+static inline bool display_runtime_present_ready(const DisplayRuntimeSnapshot& s,
+                                                 uint64_t generation)
+{
+    return s.connected &&
+           s.hwcDisplay != nullptr &&
+           s.generation == generation;
+}
+
 hwc2_compat_device_t* hwcDevice;
 
 static inline void request_display_resync(int drv_display_id)
@@ -1081,18 +1089,20 @@ static void present_thread_main()
             if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays || !j.rwb)
                 continue;
 
-            hwc2_compat_display_t* hwcDisp = nullptr;
-            {
-                std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
-                std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id], std::defer_lock);
-                std::lock(state_lk, hwc_lk);
+            DisplayRuntimeSnapshot dsnap =
+                snapshot_display_runtime_atomic(j.drv_display_id);
 
-                Display& D = get_or_create_display(j.drv_display_id);
-                hwcDisp = D.hwcDisplay;
-                if (!D.connected || !hwcDisp || D.generation != j.generation)
+            if (!display_runtime_present_ready(dsnap, j.generation))
+                continue;
+
+            {
+                std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
+
+                dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
+                hwc2_compat_display_t* hwcDisp = dsnap.hwcDisplay;
+                if (!display_runtime_present_ready(dsnap, j.generation))
                     continue;
 
-                state_lk.unlock();
                 uint32_t numTypes = 0, numRequests = 0;
                 hwc2_error_t err = HWC2_ERROR_NONE;
 
@@ -1121,13 +1131,11 @@ static void present_thread_main()
                     continue;
                 }
             }
-            {
-                std::lock_guard<std::mutex> state_lk(g_state_mutex);
-                Display& D = get_or_create_display(j.drv_display_id);
-                if (!D.connected || !D.hwcDisplay || D.generation != j.generation)
-                    continue;
-                g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
-            }
+            dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
+            if (!display_runtime_present_ready(dsnap, j.generation))
+                continue;
+
+            g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
         }
         if (!g_running.load(std::memory_order_acquire))
             break;
