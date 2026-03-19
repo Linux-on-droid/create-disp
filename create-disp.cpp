@@ -469,6 +469,7 @@ enum class BufferOrigin : uint8_t {
 struct BufferEntry {
     BufferOrigin origin = BufferOrigin::Imported;
     native_handle_t* handle = nullptr;
+    std::atomic<bool> live{true};
     // created first swap_to:
     SharedRwb rwb;
     // Track geometry used to build rwb so we can detect mismatch
@@ -498,8 +499,97 @@ struct BufferEntry {
     }
 };
 
-static std::unordered_map<int, std::shared_ptr<BufferEntry>> g_buffers;
+struct BufferSlot {
+    std::shared_ptr<BufferEntry> entry;
+};
+
+static constexpr size_t kBufferSegmentShift = 10;
+static constexpr size_t kBufferSegmentSize  = size_t{1} << kBufferSegmentShift;
+static constexpr size_t kBufferSegmentMask  = kBufferSegmentSize - 1;
+static constexpr size_t kBufferMaxSegments  = 4096;
+
+struct BufferSegment {
+    BufferSlot slots[kBufferSegmentSize];
+};
+
+static std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments{};
+static std::mutex g_buffer_segment_alloc_mutex;
+static std::atomic<uint32_t> g_next_buffer_id{1};
+
 static std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
+
+static inline bool buffer_id_to_indices(int id, size_t& seg_idx, size_t& slot_idx)
+{
+    if (id <= 0)
+        return false;
+
+    const uint32_t zero_based = static_cast<uint32_t>(id - 1);
+    seg_idx = zero_based >> kBufferSegmentShift;
+    if (seg_idx >= kBufferMaxSegments)
+        return false;
+
+    slot_idx = zero_based & kBufferSegmentMask;
+    return true;
+}
+
+static inline BufferSegment* get_buffer_segment_if_present(size_t seg_idx)
+{
+    return g_buffer_segments[seg_idx].load(std::memory_order_acquire);
+}
+
+static inline BufferSegment* ensure_buffer_segment(size_t seg_idx)
+{
+    BufferSegment* seg = get_buffer_segment_if_present(seg_idx);
+    if (seg)
+        return seg;
+
+    std::lock_guard<std::mutex> lk(g_buffer_segment_alloc_mutex);
+    seg = get_buffer_segment_if_present(seg_idx);
+    if (seg)
+        return seg;
+
+    seg = new (std::nothrow) BufferSegment();
+    if (!seg)
+        return nullptr;
+
+    g_buffer_segments[seg_idx].store(seg, std::memory_order_release);
+    return seg;
+}
+
+static inline BufferSlot* get_buffer_slot_if_present(int id)
+{
+    size_t seg_idx = 0, slot_idx = 0;
+    if (!buffer_id_to_indices(id, seg_idx, slot_idx))
+        return nullptr;
+
+    BufferSegment* seg = get_buffer_segment_if_present(seg_idx);
+    if (!seg)
+        return nullptr;
+
+    return &seg->slots[slot_idx];
+}
+
+static inline BufferSlot* ensure_buffer_slot(int id)
+{
+    size_t seg_idx = 0, slot_idx = 0;
+    if (!buffer_id_to_indices(id, seg_idx, slot_idx))
+        return nullptr;
+
+    BufferSegment* seg = ensure_buffer_segment(seg_idx);
+    if (!seg)
+        return nullptr;
+
+    return &seg->slots[slot_idx];
+}
+
+static inline std::shared_ptr<BufferEntry> get_entry_atomic(int id)
+{
+    BufferSlot* slot = get_buffer_slot_if_present(id);
+    if (!slot)
+        return {};
+
+    return std::atomic_load_explicit(&slot->entry, std::memory_order_acquire);
+}
 
 static inline void unbind_buffer_from_display_locked(int buf_id, int drv_display_id)
 {
@@ -522,6 +612,15 @@ static inline void reset_buffer_binding_locked(int buf_id,
     entry->bound_slot.store(UINT32_MAX, std::memory_order_relaxed);
 }
 
+static inline bool buffer_entry_is_live_atomic(int buf_id,
+                                               const std::shared_ptr<BufferEntry>& entry)
+{
+    return entry &&
+           entry->live.load(std::memory_order_acquire) &&
+           get_entry_atomic(buf_id) == entry;
+}
+
+
 static inline void bind_buffer_to_display_locked(int buf_id,
                                                  const std::shared_ptr<BufferEntry>& entry,
                                                  int drv_display_id,
@@ -537,17 +636,40 @@ static inline void bind_buffer_to_display_locked(int buf_id,
     entry->bound_slot.store(slot, std::memory_order_relaxed);
 }
 
+static inline std::shared_ptr<BufferEntry> remove_entry_atomic(int id)
+{
+    BufferSlot* slot = get_buffer_slot_if_present(id);
+    if (!slot)
+        return {};
+
+    std::shared_ptr<BufferEntry> entry =
+        std::atomic_exchange_explicit(&slot->entry,
+                                      std::shared_ptr<BufferEntry>{},
+                                      std::memory_order_acq_rel);
+    if (entry)
+        entry->live.store(false, std::memory_order_release);
+
+    return entry;
+}
+
+static inline void unbind_buffer_everywhere_locked(int buf_id)
+{
+    for (int d = 0; d < kMaxDriverDisplays; ++d) {
+        g_display_bound_buffers[d].erase(buf_id);
+        auto it = g_displays.find(d);
+        if (it != g_displays.end())
+            it->second.slot_mgr.release(buf_id);
+    }
+}
+
 static inline void erase_buffer_locked(int buf_id)
 {
-    auto it = g_buffers.find(buf_id);
-    if (it == g_buffers.end())
+    std::shared_ptr<BufferEntry> entry = remove_entry_atomic(buf_id);
+    if (!entry)
         return;
 
-    const std::shared_ptr<BufferEntry>& entry = it->second;
-    if (entry)
-        reset_buffer_binding_locked(buf_id, entry);
-
-    g_buffers.erase(it);
+    reset_buffer_binding_locked(buf_id, entry);
+    unbind_buffer_everywhere_locked(buf_id);
 }
 
 static inline void reset_display_bindings_locked(int drv_display_id)
@@ -562,16 +684,11 @@ static inline void reset_display_bindings_locked(int drv_display_id)
         buffer_ids.push_back(buf_id);
 
     for (int buf_id : buffer_ids) {
-        auto it = g_buffers.find(buf_id);
-        if (it != g_buffers.end()) {
-            const std::shared_ptr<BufferEntry>& entry = it->second;
-            if (entry)
-                reset_buffer_binding_locked(buf_id, entry);
-            else
-                unbind_buffer_from_display_locked(buf_id, drv_display_id);
-        } else {
+        std::shared_ptr<BufferEntry> entry = get_entry_atomic(buf_id);
+        if (entry)
+            reset_buffer_binding_locked(buf_id, entry);
+        else
             unbind_buffer_from_display_locked(buf_id, drv_display_id);
-       }
     }
 
     g_display_bound_buffers[drv_display_id].clear();
@@ -579,8 +696,36 @@ static inline void reset_display_bindings_locked(int drv_display_id)
 }
 
 static constexpr size_t kExpectedHandles = 4096;
-/* buffer ids must be > 0 to not break PRIME export */
-int next_id = 1;
+
+static inline void buffer_table_reserve_ids(size_t count)
+{
+    if (count == 0)
+        return;
+
+    const size_t need_segments =
+        (count + kBufferSegmentSize - 1) / kBufferSegmentSize;
+
+    for (size_t i = 0; i < need_segments && i < kBufferMaxSegments; ++i)
+        (void)ensure_buffer_segment(i);
+}
+
+static inline void buffer_table_shutdown()
+{
+    for (size_t i = 0; i < kBufferMaxSegments; ++i) {
+        BufferSegment* seg =
+            g_buffer_segments[i].exchange(nullptr, std::memory_order_acq_rel);
+        if (!seg)
+            continue;
+
+        for (size_t j = 0; j < kBufferSegmentSize; ++j) {
+            std::atomic_store_explicit(&seg->slots[j].entry,
+                                       std::shared_ptr<BufferEntry>{},
+                                       std::memory_order_release);
+        }
+        delete seg;
+    }
+}
+
 enum poll_event_type {
     none,
     add_buf,
@@ -722,29 +867,30 @@ static inline int add_handle(native_handle_t* handle,
                                 uint32_t width,
                                 uint32_t height)
 {
-    std::lock_guard<std::mutex> lk(g_state_mutex);
+    const uint32_t raw_id =
+        g_next_buffer_id.fetch_add(1, std::memory_order_acq_rel);
+    if (raw_id == 0 || raw_id > static_cast<uint32_t>(INT_MAX))
+        return -1;
 
-    if (next_id <= 0)
-        next_id = 1;
-
-    int id = next_id++;
+    const int id = static_cast<int>(raw_id);
+    BufferSlot* slot = ensure_buffer_slot(id);
+    if (!slot)
+        return -1;
     auto e = std::make_shared<BufferEntry>();
     e->origin = origin;
     e->handle = handle;
-
     e->format = format;
     e->stride = stride;
     e->width = width;
     e->height = height;
 
-    g_buffers[id] = std::move(e);
-    return id;
-}
+    if (std::atomic_load_explicit(&slot->entry, std::memory_order_acquire)) {
+        fprintf(stderr, "Buffer slot collision for id=%d\n", id);
+        return -1;
+    }
 
-static inline std::shared_ptr<BufferEntry> get_entry_locked_nolock(int id)
-{
-    auto it = g_buffers.find(id);
-    return (it != g_buffers.end()) ? it->second : nullptr;
+    std::atomic_store_explicit(&slot->entry, e, std::memory_order_release);
+    return id;
 }
 
 struct PresentJob {
@@ -808,6 +954,9 @@ static inline bool prepare_present_job_fast(int id,
                                             const std::shared_ptr<BufferEntry>& entry,
                                            PresentJob& out)
 {
+    if (unlikely(!entry || !entry->live.load(std::memory_order_acquire)))
+        return false;
+
     DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(drv_display_id);
     if (unlikely(!dsnap.hwcDisplay || !dsnap.connected ||
                  dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0)) {
@@ -844,6 +993,8 @@ static inline bool prepare_present_job_fast(int id,
     SharedRwb rwb;
     if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb))
         return false;
+    if (unlikely(!entry->live.load(std::memory_order_acquire)))
+        return false;
 
     out.drv_display_id = drv_display_id;
     out.buf_id = id;
@@ -869,7 +1020,7 @@ static inline bool prepare_present_job_slow(int id,
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
 
-        if (get_entry_locked_nolock(id) != entry || !entry->handle) {
+        if (!buffer_entry_is_live_atomic(id, entry) || !entry->handle) {
             request_display_resync(drv_display_id);
             return false;
         }
@@ -952,7 +1103,8 @@ static inline bool prepare_present_job_slow(int id,
 
         if (entry->bound_display_id.load(std::memory_order_acquire) != drv_display_id ||
             entry->bound_generation.load(std::memory_order_acquire) != dsnap.generation ||
-            entry->bound_slot.load(std::memory_order_acquire) != slot) {
+            entry->bound_slot.load(std::memory_order_acquire) != slot ||
+            !entry->live.load(std::memory_order_acquire)) {
             return false;
         }
 
@@ -1432,13 +1584,9 @@ void get_buf_from_map(void *data, int poll_id) {
 
     cmd.poll_id = poll_id;
 
-    std::shared_ptr<BufferEntry> entry;
-    native_handle_t* handle = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        entry = get_entry_locked_nolock(id);
-        handle = (entry && entry->handle) ? entry->handle : nullptr;
-    }
+    std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
+    native_handle_t* handle =
+        (entry && entry->live.load(std::memory_order_acquire)) ? entry->handle : nullptr;
 
     if (!handle) {
         cmd.version = -1;
@@ -1467,14 +1615,9 @@ void swap_to_buff(void *data, int poll_id) {
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
 
-    std::shared_ptr<BufferEntry> entry;
+    std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
 
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        entry = get_entry_locked_nolock(id);
-    }
-
-    if (!entry || !entry->handle) {
+    if (!entry || !entry->live.load(std::memory_order_acquire) || !entry->handle) {
         request_display_resync(drv_display_id);
         return;
     }
@@ -1900,7 +2043,7 @@ int main() {
 
     init_free_driver_slots_once();
 
-    g_buffers.reserve(kExpectedHandles);
+    buffer_table_reserve_ids(kExpectedHandles);
     g_displays.reserve(kMaxDriverDisplays);
     g_hwc_to_drv.reserve(kMaxDriverDisplays);
     g_drv_to_hwc.reserve(kMaxDriverDisplays);
@@ -2035,6 +2178,8 @@ int main() {
     g_update_cv.notify_all();
     if (g_update_thread.joinable())
         g_update_thread.join();
+
+    buffer_table_shutdown();
 
     sd_notify(0, "STATUS=Shutting down…");
     return EXIT_SUCCESS;
