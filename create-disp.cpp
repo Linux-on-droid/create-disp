@@ -12,6 +12,7 @@
 #include <memory>
 #include <cassert>
 #include <unordered_map>
+#include <unordered_set>
 #include <new>
 #include <vector>
 #include <fstream>
@@ -498,18 +499,20 @@ struct BufferEntry {
 };
 
 static std::unordered_map<int, std::shared_ptr<BufferEntry>> g_buffers;
+static std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
 
-static inline void erase_buffer_locked(int buf_id)
+static inline void unbind_buffer_from_display_locked(int buf_id, int drv_display_id)
 {
-    auto it = g_buffers.find(buf_id);
-    if (it != g_buffers.end())
-        g_buffers.erase(it);
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return;
 
-    for (auto& kv : g_displays)
-        kv.second.slot_mgr.release(buf_id);
+    g_display_bound_buffers[drv_display_id].erase(buf_id);
+    Display& D = get_or_create_display(drv_display_id);
+    D.slot_mgr.release(buf_id);
 }
 
-static inline void reset_buffer_binding_locked(const std::shared_ptr<BufferEntry>& entry)
+static inline void reset_buffer_binding_locked(int buf_id,
+                                               const std::shared_ptr<BufferEntry>& entry)
 {
     if (!entry)
         return;
@@ -519,28 +522,59 @@ static inline void reset_buffer_binding_locked(const std::shared_ptr<BufferEntry
     entry->bound_slot.store(UINT32_MAX, std::memory_order_relaxed);
 }
 
+static inline void bind_buffer_to_display_locked(int buf_id,
+                                                 const std::shared_ptr<BufferEntry>& entry,
+                                                 int drv_display_id,
+                                                 uint64_t generation,
+                                                 uint32_t slot)
+{
+    if (!entry || drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return;
+
+    g_display_bound_buffers[drv_display_id].insert(buf_id);
+    entry->bound_display_id.store(drv_display_id, std::memory_order_relaxed);
+    entry->bound_generation.store(generation, std::memory_order_relaxed);
+    entry->bound_slot.store(slot, std::memory_order_relaxed);
+}
+
+static inline void erase_buffer_locked(int buf_id)
+{
+    auto it = g_buffers.find(buf_id);
+    if (it == g_buffers.end())
+        return;
+
+    const std::shared_ptr<BufferEntry>& entry = it->second;
+    if (entry)
+        reset_buffer_binding_locked(buf_id, entry);
+
+    g_buffers.erase(it);
+}
+
 static inline void reset_display_bindings_locked(int drv_display_id)
 {
+    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays)
+        return;
+
     Display& D = get_or_create_display(drv_display_id);
-
     std::vector<int> buffer_ids;
-    buffer_ids.reserve(g_buffers.size());
-    for (const auto& kv : g_buffers)
-        buffer_ids.push_back(kv.first);
-
-    for (int buf_id : buffer_ids)
-        D.slot_mgr.release(buf_id);
+    buffer_ids.reserve(g_display_bound_buffers[drv_display_id].size());
+    for (int buf_id : g_display_bound_buffers[drv_display_id])
+        buffer_ids.push_back(buf_id);
 
     for (int buf_id : buffer_ids) {
         auto it = g_buffers.find(buf_id);
         if (it != g_buffers.end()) {
             const std::shared_ptr<BufferEntry>& entry = it->second;
-            if (entry &&
-                entry->bound_display_id.load(std::memory_order_relaxed) == drv_display_id)
-                reset_buffer_binding_locked(entry);
-        }
+            if (entry)
+                reset_buffer_binding_locked(buf_id, entry);
+            else
+                unbind_buffer_from_display_locked(buf_id, drv_display_id);
+        } else {
+            unbind_buffer_from_display_locked(buf_id, drv_display_id);
+       }
     }
 
+    g_display_bound_buffers[drv_display_id].clear();
     D.slot_mgr.reset();
 }
 
@@ -883,9 +917,7 @@ static inline bool prepare_present_job_slow(int id,
                 request_display_resync(drv_display_id);
                 return false;
             }
-           reset_buffer_binding_locked(entry);
-            entry->bound_display_id.store(drv_display_id, std::memory_order_relaxed);
-            entry->bound_generation.store(dsnap.generation, std::memory_order_relaxed);
+            reset_buffer_binding_locked(id, entry);
         }
 
         slot = D.slot_mgr.assign(id);
@@ -896,7 +928,8 @@ static inline bool prepare_present_job_slow(int id,
             return false;
         }
 
-        entry->bound_slot.store(slot, std::memory_order_relaxed);
+        bind_buffer_to_display_locked(id, entry, drv_display_id,
+                                      dsnap.generation, slot);
         get_entry_buffer_geometry(entry, dsnap, buf_stride, buf_w, buf_h, buf_format);
     }
 
