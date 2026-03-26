@@ -4,43 +4,48 @@ namespace create_disp {
 
 SlotManager::SlotManager()
 {
-    slot_free.fill(1);
+    reset();
 }
 
 void SlotManager::reset()
 {
-    bufid_to_slot.clear();
-    slot_to_bufid.clear();
-    slot_lastused.clear();
-    slot_free.fill(1);
+    slot_bufid.fill(-1);
+    slot_lastused.fill(0);
+    slot_in_use.fill(0);
     use_counter = 0;
 }
 
 uint32_t SlotManager::assign(int bufid)
 {
-    auto it = bufid_to_slot.find(bufid);
-    if (it != bufid_to_slot.end()) {
-        slot_lastused[it->second] = ++use_counter;
-        return it->second;
-    }
-
-    for (uint32_t i = 0; i < kCapacity; ++i) {
-        if (slot_free[i]) {
-            slot_free[i] = 0;
-            bufid_to_slot[bufid] = i;
-            slot_to_bufid[i] = bufid;
-            slot_lastused[i] = ++use_counter;
-            return i;
-        }
-    }
-
+    const uint64_t now = ++use_counter;
+    uint32_t free_slot = UINT32_MAX;
     uint32_t lru_slot = UINT32_MAX;
     uint64_t lru_time = UINT64_MAX;
-    for (auto& kv : slot_lastused) {
-        if (kv.second < lru_time) {
-            lru_time = kv.second;
-            lru_slot = kv.first;
+
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        if (!slot_in_use[i]) {
+            if (free_slot == UINT32_MAX) {
+                free_slot = i;
+            }
+            continue;
         }
+
+        if (slot_bufid[i] == bufid) {
+            slot_lastused[i] = now;
+            return i;
+        }
+
+        if (slot_lastused[i] < lru_time) {
+            lru_time = slot_lastused[i];
+            lru_slot = i;
+        }
+    }
+
+    if (free_slot != UINT32_MAX) {
+        slot_in_use[free_slot] = 1;
+        slot_bufid[free_slot] = bufid;
+        slot_lastused[free_slot] = now;
+        return free_slot;
     }
 
     if (lru_slot == UINT32_MAX) {
@@ -48,11 +53,9 @@ uint32_t SlotManager::assign(int bufid)
         return UINT32_MAX;
     }
 
-    int evicted = slot_to_bufid[lru_slot];
-    bufid_to_slot.erase(evicted);
-    bufid_to_slot[bufid] = lru_slot;
-    slot_to_bufid[lru_slot] = bufid;
-    slot_lastused[lru_slot] = ++use_counter;
+    const int evicted = slot_bufid[lru_slot];
+    slot_bufid[lru_slot] = bufid;
+    slot_lastused[lru_slot] = now;
     fprintf(stderr, "SlotManager: evicted bufid %d from slot %u for bufid %d\n",
             evicted, lru_slot, bufid);
     return lru_slot;
@@ -60,16 +63,16 @@ uint32_t SlotManager::assign(int bufid)
 
 void SlotManager::release(int bufid)
 {
-    auto it = bufid_to_slot.find(bufid);
-    if (it == bufid_to_slot.end()) {
+    for (uint32_t i = 0; i < kCapacity; ++i) {
+        if (!slot_in_use[i] || slot_bufid[i] != bufid) {
+            continue;
+        }
+
+        slot_in_use[i] = 0;
+        slot_bufid[i] = -1;
+        slot_lastused[i] = 0;
         return;
     }
-
-    uint32_t slot = it->second;
-    slot_free[slot] = 1;
-    slot_to_bufid.erase(slot);
-    slot_lastused.erase(slot);
-    bufid_to_slot.erase(it);
 }
 
 BufferEntry::~BufferEntry()

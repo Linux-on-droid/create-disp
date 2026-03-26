@@ -167,10 +167,9 @@ constexpr size_t kBufferMaxSegments = 4096;
 struct SlotManager {
     static constexpr uint32_t kCapacity = 32;
 
-    std::unordered_map<int, uint32_t> bufid_to_slot;
-    std::unordered_map<uint32_t, int> slot_to_bufid;
-    std::unordered_map<uint32_t, uint64_t> slot_lastused;
-    std::array<uint8_t, kCapacity> slot_free{};
+    std::array<int, kCapacity> slot_bufid{};
+    std::array<uint64_t, kCapacity> slot_lastused{};
+    std::array<uint8_t, kCapacity> slot_in_use{};
     uint64_t use_counter = 0;
 
     SlotManager();
