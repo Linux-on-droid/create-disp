@@ -253,8 +253,13 @@ struct PresentJob {
     int buf_id = -1;
     uint32_t slot = 0;
     uint64_t generation = 0;
-    std::shared_ptr<BufferEntry> entry;
     SharedRwb rwb;
+};
+
+enum class PreparePresentJobResult : uint8_t {
+    Ready = 0,
+    NeedSlow = 1,
+    Abort = 2,
 };
 
 struct alignas(64) PresentMailbox {
@@ -418,7 +423,7 @@ SharedRwb load_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry);
 void store_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry, const SharedRwb& rwb);
 void get_entry_buffer_geometry(const std::shared_ptr<BufferEntry>& entry, const DisplayRuntimeSnapshot& dsnap, uint32_t& buf_stride, int& buf_w, int& buf_h, int& buf_format);
 bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry, int buf_w, int buf_h, uint32_t buf_stride, int buf_format, SharedRwb& out_rwb);
-bool prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
+PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
 bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
 
 void notify_present_thread();

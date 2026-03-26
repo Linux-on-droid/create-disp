@@ -385,16 +385,15 @@ bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry, int buf
            entry->rwb_format.load(std::memory_order_acquire) == buf_format;
 }
 
-bool prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out)
+PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out)
 {
-    if (unlikely(!entry || !entry->live.load(std::memory_order_acquire))) {
-        return false;
-    }
+    if (unlikely(!entry || !entry->live.load(std::memory_order_acquire)))
+        return PreparePresentJobResult::Abort;
 
     DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(drv_display_id);
     if (unlikely(!dsnap.hwcDisplay || !dsnap.connected || dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0)) {
         request_display_resync(drv_display_id);
-        return false;
+        return PreparePresentJobResult::Abort;
     }
 
     const int bound_display = entry->bound_display_id.load(std::memory_order_acquire);
@@ -403,9 +402,8 @@ bool prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<
 
     if (bound_display != drv_display_id ||
         bound_generation != dsnap.generation ||
-        bound_slot == UINT32_MAX) {
-        return false;
-    }
+        bound_slot == UINT32_MAX)
+        return PreparePresentJobResult::NeedSlow;
 
     uint32_t buf_stride = 0;
     int buf_w = 0;
@@ -417,25 +415,22 @@ bool prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<
         fprintf(stderr, "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
                 id, (int)entry->origin, buf_w, buf_h, buf_stride);
         request_display_resync(drv_display_id);
-        return false;
+        return PreparePresentJobResult::Abort;
     }
 
     SharedRwb rwb;
-    if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb)) {
-        return false;
-    }
+    if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb))
+        return PreparePresentJobResult::NeedSlow;
 
-    if (unlikely(!entry->live.load(std::memory_order_acquire))) {
-        return false;
-    }
+    if (unlikely(!entry->live.load(std::memory_order_acquire)))
+        return PreparePresentJobResult::Abort;
 
     out.drv_display_id = drv_display_id;
     out.buf_id = id;
     out.generation = dsnap.generation;
     out.slot = bound_slot;
-    out.entry = entry;
     out.rwb = std::move(rwb);
-    return true;
+    return PreparePresentJobResult::Ready;
 }
 
 bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out)
@@ -540,7 +535,6 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
     out.buf_id = id;
     out.generation = dsnap.generation;
     out.slot = slot;
-    out.entry = entry;
     out.rwb = std::move(rwb);
     return true;
 }
@@ -594,9 +588,16 @@ void swap_to_buff(void *data, int poll_id)
     }
 
     PresentJob j;
-    if (!prepare_present_job_fast(id, drv_display_id, entry, j) &&
-        !prepare_present_job_slow(id, drv_display_id, entry, j)) {
+    switch (prepare_present_job_fast(id, drv_display_id, entry, j)) {
+    case PreparePresentJobResult::Ready:
+        break;
+    case PreparePresentJobResult::Abort:
         return;
+    case PreparePresentJobResult::NeedSlow:
+        if (!prepare_present_job_slow(id, drv_display_id, entry, j)) {
+            return;
+        }
+        break;
     }
 
     enqueue_present_job(std::move(j));
