@@ -276,19 +276,11 @@ void reset_display_bindings_locked(int drv_display_id)
     }
 
     Display& D = get_or_create_display(drv_display_id);
-    std::vector<int> buffer_ids;
-    buffer_ids.reserve(g_display_bound_buffers[drv_display_id].size());
 
     for (int buf_id : g_display_bound_buffers[drv_display_id]) {
-        buffer_ids.push_back(buf_id);
-    }
-
-    for (int buf_id : buffer_ids) {
         std::shared_ptr<BufferEntry> entry = get_entry_atomic(buf_id);
         if (entry) {
             reset_buffer_binding_locked(buf_id, entry);
-        } else {
-            unbind_buffer_from_display_locked(buf_id, drv_display_id);
         }
     }
 
