@@ -396,7 +396,7 @@ void onRefreshReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
         return;
     }
 
-    printf("onRefreshReceived (HWC %" PRIu64 ") -> driver slot %d\n", (uint64_t)hwc_id, drv_id);
+    //printf("onRefreshReceived (HWC %" PRIu64 ") -> driver slot %d\n", (uint64_t)hwc_id, drv_id);
     schedule_update(drv_id);
 }
 
