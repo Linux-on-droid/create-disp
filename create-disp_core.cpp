@@ -116,9 +116,12 @@ void publish_update_work(int drv_display_id, uint8_t work_bits)
     }
 
     g_update_work[drv_display_id].fetch_or(work_bits, std::memory_order_acq_rel);
-    g_update_pending_mask.fetch_or(uint32_t(1) << uint32_t(drv_display_id),
-                                   std::memory_order_acq_rel);
-    g_update_cv.notify_one();
+    const uint32_t bit = uint32_t(1) << uint32_t(drv_display_id);
+    const uint32_t prev =
+        g_update_pending_mask.fetch_or(bit, std::memory_order_acq_rel);
+    if ((prev & bit) == 0) {
+        g_update_cv.notify_one();
+    }
 }
 
 void schedule_update(int drv_display_id)
