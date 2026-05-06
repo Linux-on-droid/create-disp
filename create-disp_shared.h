@@ -333,7 +333,8 @@ extern bool g_free_drv_ids_initialized;
 extern std::atomic<bool> drm_ready;
 extern std::array<std::atomic<bool>, kMaxDriverDisplays> g_resync_pending;
 
-extern std::mutex g_state_mutex;
+extern std::mutex g_display_mutex;
+extern std::mutex g_buffer_mutex;
 extern std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
 extern std::shared_mutex g_drm_mutex;
 

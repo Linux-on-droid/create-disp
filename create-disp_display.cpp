@@ -294,7 +294,7 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
     int drv_id = drv_id_for_hwc_atomic(hwc_id);
 
     if (drv_id < 0) {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
+        std::lock_guard<std::mutex> lk(g_display_mutex);
         drv_id = drv_id_for_hwc(hwc_id);
     }
 
@@ -327,7 +327,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
             hwc2_compat_device_get_display_by_id(hwcDevice, display);
 
         {
-            std::lock_guard<std::mutex> lk(g_state_mutex);
+            std::lock_guard<std::mutex> lk(g_display_mutex);
             drv_id = drv_id_for_hwc(hwc_id);
             if (drv_id < 0) {
                 drv_id = alloc_driver_slot_for_hwc(hwc_id);
@@ -340,7 +340,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
         }
 
         {
-            std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
+            std::unique_lock<std::mutex> state_lk(g_display_mutex, std::defer_lock);
             std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
             std::lock(state_lk, hwc_lk);
 
@@ -358,7 +358,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
         }
     } else {
         {
-            std::lock_guard<std::mutex> lk(g_state_mutex);
+            std::lock_guard<std::mutex> lk(g_display_mutex);
             drv_id = drv_id_for_hwc(hwc_id);
             if (drv_id < 0) {
                 return;
@@ -366,7 +366,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
         }
 
         {
-            std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
+            std::unique_lock<std::mutex> state_lk(g_display_mutex, std::defer_lock);
             std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
             std::lock(state_lk, hwc_lk);
 
@@ -374,7 +374,6 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
             D.connected = false;
             publish_display_runtime_locked(drv_id);
         }
-
         schedule_disconnect(drv_id);
     }
 }
@@ -388,7 +387,7 @@ void onRefreshReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
     int drv_id = drv_id_for_hwc_atomic(hwc_id);
 
     if (drv_id < 0) {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
+        std::lock_guard<std::mutex> lk(g_display_mutex);
         drv_id = drv_id_for_hwc(hwc_id);
     }
 
@@ -470,7 +469,7 @@ int update_display(int display_id)
     bool mode_changed = false;
 
     {
-        std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
+        std::unique_lock<std::mutex> state_lk(g_display_mutex, std::defer_lock);
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[display_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
 
@@ -541,7 +540,7 @@ int update_display(int display_id)
     }
 
     {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
+        std::lock_guard<std::mutex> lk(g_display_mutex);
         Display& D = get_or_create_display(display_id);
         if (D.generation == generation) {
             D.width = target_width;
@@ -569,7 +568,7 @@ void disconnect_display(int drv_id)
     }
 
     {
-        std::unique_lock<std::mutex> state_lk(g_state_mutex, std::defer_lock);
+        std::unique_lock<std::mutex> state_lk(g_display_mutex, std::defer_lock);
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
 

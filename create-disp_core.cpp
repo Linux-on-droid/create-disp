@@ -10,7 +10,8 @@ bool g_free_drv_ids_initialized = false;
 std::atomic<bool> drm_ready{false};
 std::array<std::atomic<bool>, kMaxDriverDisplays> g_resync_pending{};
 
-std::mutex g_state_mutex;
+std::mutex g_display_mutex;
+std::mutex g_buffer_mutex;
 std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
 std::shared_mutex g_drm_mutex;
 

@@ -443,7 +443,7 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
     int buf_format = 0;
 
     {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
+        std::lock_guard<std::mutex> lk(g_display_mutex);
 
         if (!buffer_entry_is_live_atomic(id, entry) || !entry->handle) {
             request_display_resync(drv_display_id);
@@ -607,7 +607,7 @@ void destroy_buff(void *data, int poll_id)
 {
     int id = *(int *)data;
     {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
+        std::lock_guard<std::mutex> lk(g_buffer_mutex);
         erase_buffer_locked(id);
     }
 
@@ -641,7 +641,7 @@ void create_buff(void *data, int poll_id)
 
     ret = drm_ioctl(DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK, &cmd);
     if (ret < 0) {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
+        std::lock_guard<std::mutex> lk(g_buffer_mutex);
         erase_buffer_locked(cmd.id);
     }
 }

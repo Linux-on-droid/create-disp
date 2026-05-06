@@ -189,7 +189,7 @@ void poll_thread_main()
                 int reconnect_count = 0;
 
                 {
-                    std::lock_guard<std::mutex> slk(g_state_mutex);
+                    std::lock_guard<std::mutex> slk(g_display_mutex);
                     for (auto &kv : g_displays) {
                         reset_display_bindings_locked(kv.first);
                         if (kv.second.connected && kv.second.hwcDisplay) {
