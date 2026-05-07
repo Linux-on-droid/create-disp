@@ -26,37 +26,48 @@ void present_thread_main()
             }
 
             {
-                std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
-
-                dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
                 hwc2_compat_display_t* hwcDisp = dsnap.hwcDisplay;
-                if (!display_runtime_present_ready(dsnap, j.generation)) {
-                    continue;
-                }
-
-                uint32_t numTypes = 0;
-                uint32_t numRequests = 0;
                 hwc2_error_t err = HWC2_ERROR_NONE;
+                {
+                    std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
 
-                err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
-                                                            -1, HAL_DATASPACE_UNKNOWN);
-                if (err != HWC2_ERROR_NONE) {
-                    fprintf(stderr, "set_client_target failed: %d\n", (int)err);
-                    request_display_resync(j.drv_display_id);
-                    continue;
-                }
+                    dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
+                    if (!display_runtime_present_ready(dsnap, j.generation)) {
+                        continue;
+                    }
 
-                err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
-                if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
-                    (void)hwc2_compat_display_accept_changes(hwcDisp);
-                } else if (err != HWC2_ERROR_NONE) {
-                    fprintf(stderr, "validate failed: %d\n", (int)err);
-                    request_display_resync(j.drv_display_id);
-                    continue;
+                    hwcDisp = dsnap.hwcDisplay;
+                    if (!hwcDisp) {
+                        continue;
+                    }
+
+                    uint32_t numTypes = 0;
+                    uint32_t numRequests = 0;
+
+                    err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
+                                                                -1, HAL_DATASPACE_UNKNOWN);
+                    if (err != HWC2_ERROR_NONE) {
+                        fprintf(stderr, "set_client_target failed: %d\n", (int)err);
+                        request_display_resync(j.drv_display_id);
+                        continue;
+                    }
+
+                    err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
+                    if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
+                        (void)hwc2_compat_display_accept_changes(hwcDisp);
+                    } else if (err != HWC2_ERROR_NONE) {
+                        fprintf(stderr, "validate failed: %d\n", (int)err);
+                        request_display_resync(j.drv_display_id);
+                        continue;
+                    }
                 }
 
                 int presentFence = -1;
-                err = hwc2_compat_display_present(hwcDisp, &presentFence);
+                {
+                    std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
+                    err = hwc2_compat_display_present(hwcDisp, &presentFence);
+                }
+
                 if (err != HWC2_ERROR_NONE) {
                     fprintf(stderr, "present failed: %d\n", (int)err);
                     request_display_resync(j.drv_display_id);
@@ -110,7 +121,8 @@ void update_thread_main()
 
         if (do_disconnect) {
             disconnect_display(disp);
-        } else if (do_update) {
+        }
+        if (do_update) {
             (void)update_display(disp);
         }
     }
@@ -121,34 +133,35 @@ void evdi_event_thread_main()
     while (g_running.load(std::memory_order_acquire)) {
         QueuedEvdiEvent ev;
 
-        if (g_evdi_event_queue.pop(ev)) {
+        while (g_evdi_event_queue.pop(ev)) {
             switch (ev.event) {
-            case get_buf:
-                get_buf_from_map(ev.data, ev.poll_id);
-                break;
-            case swap_to:
-                swap_to_buff(ev.data, ev.poll_id);
-                break;
-            case destroy_buf:
-                destroy_buff(ev.data, ev.poll_id);
-                break;
-            case create_buf:
-                create_buff(ev.data, ev.poll_id);
-                break;
-            default:
-                break;
+                case swap_to:
+                    swap_to_buff(ev.data, ev.poll_id);
+                    break;
+                case get_buf:
+                    get_buf_from_map(ev.data, ev.poll_id);
+                    break;
+                case destroy_buf:
+                    destroy_buff(ev.data, ev.poll_id);
+                    break;
+                case create_buf:
+                    create_buff(ev.data, ev.poll_id);
+                    break;
+                default:
+                    break;
             }
-        } else {
+        }
+
+        if (g_evdi_event_queue.empty()) {
             std::unique_lock<std::mutex> lk(g_evdi_event_mutex);
-            if (!g_evdi_event_queue.empty()) {
-                continue;
+            if (g_evdi_event_queue.empty()) {
+                g_evdi_event_thread_sleeping.store(true, std::memory_order_release);
+                g_evdi_event_cv.wait(lk, [] {
+                    return !g_running.load(std::memory_order_acquire) ||
+                           !g_evdi_event_queue.empty();
+                });
+                g_evdi_event_thread_sleeping.store(false, std::memory_order_release);
             }
-            g_evdi_event_thread_sleeping.store(true, std::memory_order_release);
-            g_evdi_event_cv.wait(lk, [] {
-                return !g_running.load(std::memory_order_acquire) ||
-                       !g_evdi_event_queue.empty();
-            });
-            g_evdi_event_thread_sleeping.store(false, std::memory_order_release);
         }
     }
 }
