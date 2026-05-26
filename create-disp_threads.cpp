@@ -10,7 +10,7 @@ void present_thread_main()
 
         while (take_next_present_display(d)) {
             PresentJob j;
-            if (!try_dequeue_present_job(d, j)) {
+            if (!try_dequeue_present_job(d, j)) [[unlikely]] {
                 continue;
             }
 
@@ -111,7 +111,7 @@ void update_thread_main()
             break;
         }
 
-        if (!take_next_update_display(disp)) {
+        if (!take_next_update_display(disp)) [[unlikely]] {
             continue;
         }
 
@@ -225,7 +225,7 @@ void poll_thread_main()
         poll_cmd.data = poll_payload;
 
         int ret = drm_ioctl(DRM_IOCTL_EVDI_POLL, &poll_cmd);
-        if (ret < 0) {
+        if (ret < 0) [[unlikely]] {
             if (errno == EINTR || errno == ERESTART) {
                 if (!g_running.load(std::memory_order_acquire)) {
                     break;
@@ -247,13 +247,13 @@ void poll_thread_main()
 
         hard_poll_failures = 0;
 
-        if (poll_cmd.event != none) {
+        if (poll_cmd.event != none) [[likely]] {
             QueuedEvdiEvent q_ev;
             q_ev.event = poll_cmd.event;
             q_ev.poll_id = poll_cmd.poll_id;
             std::memcpy(q_ev.data, poll_payload, sizeof(poll_payload));
 
-            if (!g_evdi_event_queue.push(q_ev)) {
+            if (!g_evdi_event_queue.push(q_ev)) [[unlikely]] {
                 fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");
             }
 

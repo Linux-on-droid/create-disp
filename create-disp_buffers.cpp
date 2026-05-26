@@ -385,11 +385,11 @@ bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry, int buf
 
 PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out)
 {
-    if (unlikely(!entry || !entry->live.load(std::memory_order_acquire)))
+    if (!entry || !entry->live.load(std::memory_order_acquire)) [[unlikely]]
         return PreparePresentJobResult::Abort;
 
     DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(drv_display_id);
-    if (unlikely(!dsnap.hwcDisplay || !dsnap.connected || dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0)) {
+    if (!dsnap.hwcDisplay || !dsnap.connected || dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0) [[unlikely]] {
         request_display_resync(drv_display_id);
         return PreparePresentJobResult::Abort;
     }
@@ -400,7 +400,7 @@ PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, con
 
     if (bound_display != drv_display_id ||
         bound_generation != dsnap.generation ||
-        bound_slot == UINT32_MAX)
+        bound_slot == UINT32_MAX) [[unlikely]]
         return PreparePresentJobResult::NeedSlow;
 
     uint32_t buf_stride = 0;
@@ -409,7 +409,7 @@ PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, con
     int buf_format = 0;
     get_entry_buffer_geometry(entry, dsnap, buf_stride, buf_w, buf_h, buf_format);
 
-    if (unlikely(buf_stride == 0 || buf_w <= 0 || buf_h <= 0)) {
+    if (buf_stride == 0 || buf_w <= 0 || buf_h <= 0) [[unlikely]] {
         fprintf(stderr, "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
                 id, (int)entry->origin, buf_w, buf_h, buf_stride);
         request_display_resync(drv_display_id);
@@ -417,10 +417,10 @@ PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, con
     }
 
     SharedRwb rwb;
-    if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb))
+    if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb)) [[unlikely]]
         return PreparePresentJobResult::NeedSlow;
 
-    if (unlikely(!entry->live.load(std::memory_order_acquire)))
+    if (!entry->live.load(std::memory_order_acquire)) [[unlikely]]
         return PreparePresentJobResult::Abort;
 
     out.drv_display_id = drv_display_id;
@@ -456,7 +456,7 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
         dsnap.connected = D.connected;
         dsnap.generation = D.generation;
 
-        if (unlikely(!dsnap.hwcDisplay || !dsnap.connected || dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0)) {
+        if (!dsnap.hwcDisplay || !dsnap.connected || dsnap.width <= 0 || dsnap.height <= 0 || dsnap.stride == 0) [[unlikely]] {
             request_display_resync(drv_display_id);
             return false;
         }
@@ -499,7 +499,7 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
         get_entry_buffer_geometry(entry, dsnap, buf_stride, buf_w, buf_h, buf_format);
     }
 
-    if (unlikely(buf_stride == 0 || buf_w <= 0 || buf_h <= 0)) {
+    if (buf_stride == 0 || buf_w <= 0 || buf_h <= 0) [[unlikely]] {
         fprintf(stderr, "Invalid buffer geometry for id=%d (origin=%d, w=%d, h=%d, stride=%u)\n",
                 id, (int)entry->origin, buf_w, buf_h, buf_stride);
         request_display_resync(drv_display_id);
@@ -509,7 +509,7 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
     SharedRwb rwb;
     if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb)) {
         SharedRwb new_rwb = make_rwb(buf_w, buf_h, buf_stride, buf_format, kRwbUsage, entry->handle);
-        if (unlikely(!new_rwb)) {
+        if (!new_rwb) [[unlikely]] {
             fprintf(stderr, "Failed to allocate RemoteWindowBuffer for id=%d\n", id);
             return false;
         }

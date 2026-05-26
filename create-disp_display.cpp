@@ -47,7 +47,7 @@ DisplayRuntimeSnapshot snapshot_display_runtime_atomic(int display_id)
 
     for (;;) {
         uint64_t seq1 = R.seq.load(std::memory_order_acquire);
-        if (seq1 & 1ULL) {
+        if (seq1 & 1ULL) [[unlikely]] {
             std::this_thread::yield();
             continue;
         }
@@ -61,7 +61,7 @@ DisplayRuntimeSnapshot snapshot_display_runtime_atomic(int display_id)
         s.generation = R.generation.load(std::memory_order_relaxed);
 
         uint64_t seq2 = R.seq.load(std::memory_order_acquire);
-        if (likely(seq1 == seq2)) {
+        if (seq1 == seq2) [[likely]] {
             return s;
         }
     }
@@ -82,7 +82,7 @@ void request_display_resync(int drv_display_id)
 
     bool expected = false;
     if (!g_resync_pending[drv_display_id].compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel)) {
+            expected, true, std::memory_order_acq_rel)) [[unlikely]] {
         return;
     }
 
@@ -498,7 +498,7 @@ int update_display(int display_id)
         had_previous_mode = (D.width > 0 && D.height > 0 && D.stride != 0);
         mode_changed = (D.width != target_width || D.height != target_height);
 
-        if (!force_reconnect && !mode_changed && D.stride != 0) {
+        if (!force_reconnect && !mode_changed && D.stride != 0) [[likely]] {
             return 0;
         }
 

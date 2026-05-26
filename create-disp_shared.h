@@ -134,11 +134,6 @@ struct drm_evdi_create_buff_callabck {
     uint32_t stride;
 };
 
-#ifndef likely
-#define likely(x) __builtin_expect(!!(x), 1)
-#define unlikely(x) __builtin_expect(!!(x), 0)
-#endif
-
 struct RwbDeleter {
     void operator()(RemoteWindowBuffer* p) const {
         delete p;

@@ -117,7 +117,7 @@ void publish_update_work(int drv_display_id, uint8_t work_bits)
     const uint32_t bit = uint32_t(1) << uint32_t(drv_display_id);
     const uint32_t prev =
         g_update_pending_mask.fetch_or(bit, std::memory_order_release);
-    if ((prev & bit) == 0) {
+    if ((prev & bit) == 0) [[likely]] {
         g_update_wake_seq.fetch_add(1, std::memory_order_release);
         g_update_wake_seq.notify_one();
     }
@@ -136,7 +136,7 @@ void schedule_disconnect(int drv_display_id)
 bool take_next_update_display(int& out_drv_display_id)
 {
     const uint32_t mask = g_update_pending_mask.load(std::memory_order_acquire);
-    if (mask == 0) {
+    if (mask == 0) [[unlikely]] {
         return false;
     }
 
@@ -145,12 +145,12 @@ bool take_next_update_display(int& out_drv_display_id)
         const int d = (start + i) % kMaxDriverDisplays;
         const uint32_t bit = uint32_t(1) << uint32_t(d);
 
-        if ((mask & bit) == 0) {
+        if ((mask & bit) == 0) [[likely]] {
             continue;
         }
 
         const uint32_t prev = g_update_pending_mask.fetch_and(~bit, std::memory_order_acquire);
-        if (prev & bit) {
+        if (prev & bit) [[likely]] {
             out_drv_display_id = d;
             return true;
         }
@@ -189,12 +189,12 @@ bool take_next_present_display(int& out_drv_display_id)
         const int d = (start + i) % kMaxDriverDisplays;
         const uint32_t bit = uint32_t(1) << uint32_t(d);
 
-        if ((mask & bit) == 0) {
+        if ((mask & bit) == 0) [[likely]] {
             continue;
         }
 
         const uint32_t prev = g_present_ready_mask.fetch_and(~bit, std::memory_order_acquire);
-        if (prev & bit) {
+        if (prev & bit) [[likely]] {
             out_drv_display_id = d;
             return true;
         }
@@ -211,7 +211,7 @@ bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
 
     PresentJob* p = g_present_mailboxes[drv_display_id].job_ptr.exchange(
         nullptr, std::memory_order_acquire);
-    if (!p) {
+    if (!p) [[unlikely]] {
         return false;
     }
 
@@ -234,7 +234,7 @@ void enqueue_present_job(PresentJob&& j)
 
     const uint32_t bit = uint32_t(1) << uint32_t(d);
     const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_release);
-    if ((prev & bit) == 0) {
+    if ((prev & bit) == 0) [[likely]] {
         notify_present_thread();
     }
 }
