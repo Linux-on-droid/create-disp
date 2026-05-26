@@ -224,7 +224,7 @@ struct BufferEntry {
     BufferOrigin origin = BufferOrigin::Imported;
     native_handle_t* handle = nullptr;
     std::atomic<bool> live{true};
-    SharedRwb rwb;
+    std::atomic<SharedRwb> rwb;
     std::atomic<int> rwb_w{0};
     std::atomic<int> rwb_h{0};
     std::atomic<uint32_t> rwb_stride{0};
@@ -241,7 +241,7 @@ struct BufferEntry {
 };
 
 struct BufferSlot {
-    std::shared_ptr<BufferEntry> entry;
+    std::atomic<std::shared_ptr<BufferEntry>> entry;
 };
 
 struct BufferSegment {

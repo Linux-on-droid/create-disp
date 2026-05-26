@@ -77,7 +77,7 @@ void SlotManager::release(int bufid)
 
 BufferEntry::~BufferEntry()
 {
-    rwb.reset();
+    rwb = {};
     if (!handle) {
         return;
     }
@@ -185,7 +185,7 @@ std::shared_ptr<BufferEntry> get_entry_atomic(int id)
         return {};
     }
 
-    return std::atomic_load_explicit(&slot->entry, std::memory_order_acquire);
+    return slot->entry.load(std::memory_order_acquire);
 }
 
 void unbind_buffer_from_display_locked(int buf_id, int drv_display_id)
@@ -238,9 +238,8 @@ std::shared_ptr<BufferEntry> remove_entry_atomic(int id)
     }
 
     std::shared_ptr<BufferEntry> entry =
-        std::atomic_exchange_explicit(&slot->entry,
-                                      std::shared_ptr<BufferEntry>{},
-                                      std::memory_order_acq_rel);
+        slot->entry.exchange(std::shared_ptr<BufferEntry>{},
+                             std::memory_order_acq_rel);
     if (entry) {
         entry->live.store(false, std::memory_order_release);
     }
@@ -309,9 +308,8 @@ void buffer_table_shutdown()
         }
 
         for (size_t j = 0; j < kBufferSegmentSize; ++j) {
-            std::atomic_store_explicit(&seg->slots[j].entry,
-                                       std::shared_ptr<BufferEntry>{},
-                                       std::memory_order_release);
+            seg->slots[j].entry.store(std::shared_ptr<BufferEntry>{},
+                                      std::memory_order_release);
         }
 
         delete seg;
@@ -339,23 +337,23 @@ int add_handle(native_handle_t* handle, BufferOrigin origin, int format, uint32_
     e->width = width;
     e->height = height;
 
-    if (std::atomic_load_explicit(&slot->entry, std::memory_order_acquire)) {
+    if (slot->entry.load(std::memory_order_acquire)) {
         fprintf(stderr, "Buffer slot collision for id=%d\n", id);
         return -1;
     }
 
-    std::atomic_store_explicit(&slot->entry, e, std::memory_order_release);
+    slot->entry.store(e, std::memory_order_release);
     return id;
 }
 
 SharedRwb load_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry)
 {
-    return std::atomic_load(&entry->rwb);
+    return entry->rwb.load(std::memory_order_seq_cst);
 }
 
 void store_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry, const SharedRwb& rwb)
 {
-    std::atomic_store(&entry->rwb, rwb);
+    entry->rwb.store(rwb, std::memory_order_seq_cst);
 }
 
 void get_entry_buffer_geometry(const std::shared_ptr<BufferEntry>& entry, const DisplayRuntimeSnapshot& dsnap, uint32_t& buf_stride, int& buf_w, int& buf_h, int& buf_format)
