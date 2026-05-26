@@ -221,8 +221,8 @@ void poll_thread_main()
         }
 
         drm_evdi_poll poll_cmd = {};
-        uint8_t poll_payload[32];
-        poll_cmd.data = poll_payload;
+        std::array<uint8_t, 32> poll_payload{};
+        poll_cmd.data = poll_payload.data();
 
         int ret = drm_ioctl(DRM_IOCTL_EVDI_POLL, &poll_cmd);
         if (ret < 0) [[unlikely]] {
@@ -251,7 +251,7 @@ void poll_thread_main()
             QueuedEvdiEvent q_ev;
             q_ev.event = poll_cmd.event;
             q_ev.poll_id = poll_cmd.poll_id;
-            std::memcpy(q_ev.data, poll_payload, sizeof(poll_payload));
+            q_ev.data = poll_payload;
 
             if (!g_evdi_event_queue.push(q_ev)) [[unlikely]] {
                 fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");

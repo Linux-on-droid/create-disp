@@ -307,9 +307,9 @@ void buffer_table_shutdown()
             continue;
         }
 
-        for (size_t j = 0; j < kBufferSegmentSize; ++j) {
-            seg->slots[j].entry.store(std::shared_ptr<BufferEntry>{},
-                                      std::memory_order_release);
+        for (auto& slot : seg->slots) {
+            slot.entry.store(std::shared_ptr<BufferEntry>{},
+                             std::memory_order_release);
         }
 
         delete seg;
@@ -537,11 +537,11 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
     return true;
 }
 
-void get_buf_from_map(void *data, int poll_id)
+void get_buf_from_map(const std::array<uint8_t, 32>& data, int poll_id)
 {
     int id;
+    memcpy(&id, data.data(), sizeof(int));
     struct drm_evdi_get_buff_callabck cmd = {};
-    memcpy(&id, data, sizeof(int));
     cmd.poll_id = poll_id;
 
     std::shared_ptr<BufferEntry> entry = get_entry_atomic(id);
@@ -565,16 +565,17 @@ void get_buf_from_map(void *data, int poll_id)
     (void)drm_ioctl(DRM_IOCTL_EVDI_GET_BUFF_CALLBACK, &cmd);
 }
 
-void swap_to_buff(void *data, int poll_id)
+void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
 {
     (void)poll_id;
 
-    struct {
+    struct SwapEvent {
         int id;
         int display_id;
-    } ex = { -1, 0 };
+    } ex{-1, 0};
 
-    memcpy(&ex, data, sizeof(ex));
+    static_assert(sizeof(SwapEvent) == sizeof(int) * 2);
+    memcpy(&ex, data.data(), sizeof(ex));
 
     const int id = ex.id;
     const int drv_display_id = ex.display_id;
@@ -601,9 +602,10 @@ void swap_to_buff(void *data, int poll_id)
     enqueue_present_job(std::move(j));
 }
 
-void destroy_buff(void *data, int poll_id)
+void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id)
 {
-    int id = *(int *)data;
+    int id;
+    memcpy(&id, data.data(), sizeof(id));
     {
         std::lock_guard<std::mutex> lk(g_buffer_mutex);
         erase_buffer_locked(id);
@@ -613,11 +615,11 @@ void destroy_buff(void *data, int poll_id)
     (void)drm_ioctl(DRM_IOCTL_EVDI_DESTROY_BUFF_CALLBACK, &cmd);
 }
 
-void create_buff(void *data, int poll_id)
+void create_buff(const std::array<uint8_t, 32>& data, int poll_id)
 {
     struct drm_evdi_gbm_create_buff buff_params;
     struct drm_evdi_create_buff_callabck cmd;
-    memcpy(&buff_params, data, sizeof(struct drm_evdi_gbm_create_buff));
+    memcpy(&buff_params, data.data(), sizeof(struct drm_evdi_gbm_create_buff));
 
     const native_handle_t *full_handle;
     int req_format = (buff_params.format != 0) ? (int)buff_params.format : HAL_PIXEL_FORMAT_RGBA_8888;

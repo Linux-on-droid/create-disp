@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cerrno>
 #include <climits>
@@ -238,7 +239,7 @@ struct BufferSlot {
 };
 
 struct BufferSegment {
-    BufferSlot slots[kBufferSegmentSize];
+    std::array<BufferSlot, kBufferSegmentSize> slots;
 };
 
 struct PresentJob {
@@ -262,12 +263,12 @@ struct alignas(64) PresentMailbox {
 struct QueuedEvdiEvent {
     poll_event_type event;
     int poll_id;
-    uint8_t data[32];
+    std::array<uint8_t, 32> data{};
 };
 
 template <typename T, size_t Capacity>
 class SpscRingBuffer {
-    static_assert((Capacity != 0) && ((Capacity & (Capacity - 1)) == 0), "Capacity must be power of 2");
+    static_assert(Capacity != 0 && std::has_single_bit(Capacity), "Capacity must be power of 2");
 
 private:
     struct alignas(64) {
@@ -437,10 +438,10 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
 void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_display_t display, bool connected, bool primaryDisplay);
 void onRefreshReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_display_t display);
 
-void get_buf_from_map(void *data, int poll_id);
-void swap_to_buff(void *data, int poll_id);
-void destroy_buff(void *data, int poll_id);
-void create_buff(void *data, int poll_id);
+void get_buf_from_map(const std::array<uint8_t, 32>& data, int poll_id);
+void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id);
+void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id);
+void create_buff(const std::array<uint8_t, 32>& data, int poll_id);
 
 void present_thread_main();
 void update_thread_main();
