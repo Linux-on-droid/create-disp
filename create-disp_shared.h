@@ -13,7 +13,6 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
 #include <csignal>
 #include <cstring>
@@ -335,8 +334,7 @@ extern std::mutex g_buffer_mutex;
 extern std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
 extern std::shared_mutex g_drm_mutex;
 
-extern std::mutex g_update_mutex;
-extern std::condition_variable g_update_cv;
+extern std::atomic<uint32_t> g_update_wake_seq;
 extern std::array<std::atomic<uint8_t>, kMaxDriverDisplays> g_update_work;
 extern std::atomic<uint32_t> g_update_pending_mask;
 extern std::atomic<int> g_update_rr;
@@ -368,9 +366,7 @@ extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_b
 extern std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
 extern SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
-extern std::atomic<bool> g_evdi_event_thread_sleeping;
-extern std::mutex g_evdi_event_mutex;
-extern std::condition_variable g_evdi_event_cv;
+extern std::atomic<uint32_t> g_evdi_event_wake_seq;
 extern std::thread g_evdi_event_thread;
 
 void request_reopen();

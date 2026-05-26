@@ -98,16 +98,17 @@ void update_thread_main()
     for (;;) {
         int disp = -1;
 
-        {
-            std::unique_lock<std::mutex> lk(g_update_mutex);
-            g_update_cv.wait(lk, [] {
-                return !g_running.load(std::memory_order_acquire) ||
-                       g_update_pending_mask.load(std::memory_order_acquire) != 0;
-            });
-
-            if (!g_running.load(std::memory_order_acquire)) {
-                break;
+        if (g_running.load(std::memory_order_acquire) &&
+            g_update_pending_mask.load(std::memory_order_acquire) == 0) {
+            uint32_t seq = g_update_wake_seq.load(std::memory_order_acquire);
+            if (g_running.load(std::memory_order_acquire) &&
+                g_update_pending_mask.load(std::memory_order_acquire) == 0) {
+                g_update_wake_seq.wait(seq, std::memory_order_relaxed);
             }
+        }
+
+        if (!g_running.load(std::memory_order_acquire)) {
+            break;
         }
 
         if (!take_next_update_display(disp)) {
@@ -152,15 +153,10 @@ void evdi_event_thread_main()
             }
         }
 
-        if (g_evdi_event_queue.empty()) {
-            std::unique_lock<std::mutex> lk(g_evdi_event_mutex);
-            if (g_evdi_event_queue.empty()) {
-                g_evdi_event_thread_sleeping.store(true, std::memory_order_release);
-                g_evdi_event_cv.wait(lk, [] {
-                    return !g_running.load(std::memory_order_acquire) ||
-                           !g_evdi_event_queue.empty();
-                });
-                g_evdi_event_thread_sleeping.store(false, std::memory_order_release);
+        if (g_evdi_event_queue.empty() && g_running.load(std::memory_order_acquire)) {
+            uint32_t seq = g_evdi_event_wake_seq.load(std::memory_order_acquire);
+            if (g_evdi_event_queue.empty() && g_running.load(std::memory_order_acquire)) {
+                g_evdi_event_wake_seq.wait(seq, std::memory_order_relaxed);
             }
         }
     }
@@ -261,9 +257,8 @@ void poll_thread_main()
                 fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");
             }
 
-            if (g_evdi_event_thread_sleeping.load(std::memory_order_acquire)) {
-                g_evdi_event_cv.notify_one();
-            }
+            g_evdi_event_wake_seq.fetch_add(1, std::memory_order_release);
+            g_evdi_event_wake_seq.notify_one();
         }
     }
 }
@@ -326,7 +321,8 @@ int run_create_disp()
     } catch (...) {
         fprintf(stderr, "Failed to create present thread\n");
         g_running.store(false, std::memory_order_release);
-        g_update_cv.notify_all();
+        g_update_wake_seq.fetch_add(1, std::memory_order_release);
+        g_update_wake_seq.notify_all();
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -337,6 +333,8 @@ int run_create_disp()
         fprintf(stderr, "Failed to create evdi event thread\n");
         g_running.store(false, std::memory_order_release);
         notify_present_thread();
+        g_evdi_event_wake_seq.fetch_add(1, std::memory_order_release);
+        g_evdi_event_wake_seq.notify_all();
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -347,7 +345,8 @@ int run_create_disp()
         fprintf(stderr, "Failed to create poll thread\n");
         g_running.store(false, std::memory_order_release);
         notify_present_thread();
-        g_evdi_event_cv.notify_all();
+        g_evdi_event_wake_seq.fetch_add(1, std::memory_order_release);
+        g_evdi_event_wake_seq.notify_all();
 
         if (g_evdi_event_thread.joinable()) {
             g_evdi_event_thread.join();
@@ -356,7 +355,8 @@ int run_create_disp()
             g_present_thread.join();
         }
         if (g_update_thread.joinable()) {
-            g_update_cv.notify_all();
+            g_update_wake_seq.fetch_add(1, std::memory_order_release);
+            g_update_wake_seq.notify_all();
             g_update_thread.join();
         }
 
@@ -369,8 +369,10 @@ int run_create_disp()
     }
 
     notify_present_thread();
-    g_update_cv.notify_all();
-    g_evdi_event_cv.notify_all();
+    g_update_wake_seq.fetch_add(1, std::memory_order_release);
+    g_update_wake_seq.notify_all();
+    g_evdi_event_wake_seq.fetch_add(1, std::memory_order_release);
+    g_evdi_event_wake_seq.notify_all();
 
     if (g_poll_thread.joinable()) {
         kick_thread_out_of_ioctl(g_poll_thread);
@@ -382,7 +384,8 @@ int run_create_disp()
     }
 
     sd_notify(0, "STATUS=Stopping evdi event thread…");
-    g_evdi_event_cv.notify_all();
+    g_evdi_event_wake_seq.fetch_add(1, std::memory_order_release);
+    g_evdi_event_wake_seq.notify_all();
     if (g_evdi_event_thread.joinable()) {
         g_evdi_event_thread.join();
     }
@@ -396,7 +399,8 @@ int run_create_disp()
     drm_shutdown_close_fd();
 
     sd_notify(0, "STATUS=Stopping update thread…");
-    g_update_cv.notify_all();
+    g_update_wake_seq.fetch_add(1, std::memory_order_release);
+    g_update_wake_seq.notify_all();
     if (g_update_thread.joinable()) {
         g_update_thread.join();
     }

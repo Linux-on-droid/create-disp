@@ -15,8 +15,7 @@ std::mutex g_buffer_mutex;
 std::array<std::mutex, kMaxDriverDisplays> g_hwc_mutex;
 std::shared_mutex g_drm_mutex;
 
-std::mutex g_update_mutex;
-std::condition_variable g_update_cv;
+std::atomic<uint32_t> g_update_wake_seq{0};
 std::array<std::atomic<uint8_t>, kMaxDriverDisplays> g_update_work = {};
 std::atomic<uint32_t> g_update_pending_mask{0};
 std::atomic<int> g_update_rr{0};
@@ -47,9 +46,7 @@ std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
 std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
 SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
-std::atomic<bool> g_evdi_event_thread_sleeping{false};
-std::mutex g_evdi_event_mutex;
-std::condition_variable g_evdi_event_cv;
+std::atomic<uint32_t> g_evdi_event_wake_seq{0};
 std::thread g_evdi_event_thread;
 
 void request_reopen()
@@ -121,7 +118,8 @@ void publish_update_work(int drv_display_id, uint8_t work_bits)
     const uint32_t prev =
         g_update_pending_mask.fetch_or(bit, std::memory_order_acq_rel);
     if ((prev & bit) == 0) {
-        g_update_cv.notify_one();
+        g_update_wake_seq.fetch_add(1, std::memory_order_release);
+        g_update_wake_seq.notify_one();
     }
 }
 
@@ -259,8 +257,10 @@ void handle_signal(int signo)
 {
     (void)signo;
     g_running.store(false, std::memory_order_release);
-    g_update_cv.notify_all();
-    g_evdi_event_cv.notify_all();
+    g_update_wake_seq.fetch_add(1, std::memory_order_release);
+    g_update_wake_seq.notify_all();
+    g_evdi_event_wake_seq.fetch_add(1, std::memory_order_release);
+    g_evdi_event_wake_seq.notify_all();
     notify_present_thread();
 }
 
