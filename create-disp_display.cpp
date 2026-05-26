@@ -422,7 +422,7 @@ int get_refresh_hz_from_active_config(const HWC2DisplayConfig* cfg)
 
 int reconnect_display_mode(int display_id, int target_width, int target_height, int refresh_hz, bool disconnect_first)
 {
-    g_modeset_inflight.fetch_add(1, std::memory_order_acq_rel);
+    g_modeset_inflight.fetch_add(1, std::memory_order_release);
     int rc = 0;
 
     if (disconnect_first) {
@@ -437,7 +437,7 @@ int reconnect_display_mode(int display_id, int target_width, int target_height, 
                           (uint32_t)refresh_hz, (uint32_t)display_id, 1);
     }
 
-    g_modeset_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    g_modeset_inflight.fetch_sub(1, std::memory_order_release);
     return rc;
 }
 
@@ -464,7 +464,7 @@ int update_display(int display_id)
     int refresh_hz = 60;
     uint64_t generation = 0;
     uint32_t new_stride = 0;
-    bool force_reconnect = g_resync_pending[display_id].exchange(false, std::memory_order_acq_rel);
+    bool force_reconnect = g_resync_pending[display_id].exchange(false, std::memory_order_acquire);
     bool had_previous_mode = false;
     bool mode_changed = false;
 
@@ -562,9 +562,9 @@ void disconnect_display(int drv_id)
     flush_present_jobs_for_display(drv_id);
 
     if (drm_ready.load(std::memory_order_acquire)) {
-        g_modeset_inflight.fetch_add(1, std::memory_order_acq_rel);
+        g_modeset_inflight.fetch_add(1, std::memory_order_release);
         (void)evdi_connect(0, 0, 0, 0, (uint32_t)drv_id, 0);
-        g_modeset_inflight.fetch_sub(1, std::memory_order_acq_rel);
+        g_modeset_inflight.fetch_sub(1, std::memory_order_release);
     }
 
     {

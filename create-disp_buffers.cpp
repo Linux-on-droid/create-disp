@@ -239,7 +239,7 @@ std::shared_ptr<BufferEntry> remove_entry_atomic(int id)
 
     std::shared_ptr<BufferEntry> entry =
         slot->entry.exchange(std::shared_ptr<BufferEntry>{},
-                             std::memory_order_acq_rel);
+                             std::memory_order_acquire);
     if (entry) {
         entry->live.store(false, std::memory_order_release);
     }
@@ -302,7 +302,7 @@ void buffer_table_reserve_ids(size_t count)
 void buffer_table_shutdown()
 {
     for (size_t i = 0; i < kBufferMaxSegments; ++i) {
-        BufferSegment* seg = g_buffer_segments[i].exchange(nullptr, std::memory_order_acq_rel);
+        BufferSegment* seg = g_buffer_segments[i].exchange(nullptr, std::memory_order_acquire);
         if (!seg) {
             continue;
         }
@@ -318,7 +318,7 @@ void buffer_table_shutdown()
 
 int add_handle(native_handle_t* handle, BufferOrigin origin, int format, uint32_t stride, uint32_t width, uint32_t height)
 {
-    const uint32_t raw_id = g_next_buffer_id.fetch_add(1, std::memory_order_acq_rel);
+    const uint32_t raw_id = g_next_buffer_id.fetch_add(1, std::memory_order_relaxed);
     if (raw_id == 0 || raw_id > static_cast<uint32_t>(INT_MAX)) {
         return -1;
     }
@@ -348,12 +348,12 @@ int add_handle(native_handle_t* handle, BufferOrigin origin, int format, uint32_
 
 SharedRwb load_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry)
 {
-    return entry->rwb.load(std::memory_order_seq_cst);
+    return entry->rwb.load(std::memory_order_acquire);
 }
 
 void store_entry_rwb_atomic(const std::shared_ptr<BufferEntry>& entry, const SharedRwb& rwb)
 {
-    entry->rwb.store(rwb, std::memory_order_seq_cst);
+    entry->rwb.store(rwb, std::memory_order_release);
 }
 
 void get_entry_buffer_geometry(const std::shared_ptr<BufferEntry>& entry, const DisplayRuntimeSnapshot& dsnap, uint32_t& buf_stride, int& buf_w, int& buf_h, int& buf_format)

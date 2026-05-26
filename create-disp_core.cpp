@@ -51,7 +51,7 @@ std::thread g_evdi_event_thread;
 
 void request_reopen()
 {
-    (void)g_reopen_requested.exchange(true, std::memory_order_acq_rel);
+    (void)g_reopen_requested.exchange(true, std::memory_order_release);
 }
 
 int ioctl_retry(int fd, unsigned long req, void *arg)
@@ -104,7 +104,7 @@ void clear_pending_work_atomic(int drv_display_id)
 
     g_update_work[drv_display_id].store(kUpdateWorkNone, std::memory_order_release);
     g_update_pending_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
-                                    std::memory_order_acq_rel);
+                                    std::memory_order_acquire);
 }
 
 void publish_update_work(int drv_display_id, uint8_t work_bits)
@@ -113,10 +113,10 @@ void publish_update_work(int drv_display_id, uint8_t work_bits)
         return;
     }
 
-    g_update_work[drv_display_id].fetch_or(work_bits, std::memory_order_acq_rel);
+    g_update_work[drv_display_id].fetch_or(work_bits, std::memory_order_release);
     const uint32_t bit = uint32_t(1) << uint32_t(drv_display_id);
     const uint32_t prev =
-        g_update_pending_mask.fetch_or(bit, std::memory_order_acq_rel);
+        g_update_pending_mask.fetch_or(bit, std::memory_order_release);
     if ((prev & bit) == 0) {
         g_update_wake_seq.fetch_add(1, std::memory_order_release);
         g_update_wake_seq.notify_one();
@@ -149,7 +149,7 @@ bool take_next_update_display(int& out_drv_display_id)
             continue;
         }
 
-        const uint32_t prev = g_update_pending_mask.fetch_and(~bit, std::memory_order_acq_rel);
+        const uint32_t prev = g_update_pending_mask.fetch_and(~bit, std::memory_order_acquire);
         if (prev & bit) {
             out_drv_display_id = d;
             return true;
@@ -193,7 +193,7 @@ bool take_next_present_display(int& out_drv_display_id)
             continue;
         }
 
-        const uint32_t prev = g_present_ready_mask.fetch_and(~bit, std::memory_order_acq_rel);
+        const uint32_t prev = g_present_ready_mask.fetch_and(~bit, std::memory_order_acquire);
         if (prev & bit) {
             out_drv_display_id = d;
             return true;
@@ -210,7 +210,7 @@ bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
     }
 
     PresentJob* p = g_present_mailboxes[drv_display_id].job_ptr.exchange(
-        nullptr, std::memory_order_acq_rel);
+        nullptr, std::memory_order_acquire);
     if (!p) {
         return false;
     }
@@ -229,11 +229,11 @@ void enqueue_present_job(PresentJob&& j)
     const int d = j.drv_display_id;
     PresentJob* new_job = new PresentJob(std::move(j));
     PresentJob* old = g_present_mailboxes[d].job_ptr.exchange(
-        new_job, std::memory_order_acq_rel);
+        new_job, std::memory_order_release);
     delete old;
 
     const uint32_t bit = uint32_t(1) << uint32_t(d);
-    const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_acq_rel);
+    const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_release);
     if ((prev & bit) == 0) {
         notify_present_thread();
     }
@@ -246,11 +246,11 @@ void flush_present_jobs_for_display(int drv_display_id)
     }
 
     PresentJob* old = g_present_mailboxes[drv_display_id].job_ptr.exchange(
-        nullptr, std::memory_order_acq_rel);
+        nullptr, std::memory_order_acquire);
     delete old;
 
     g_present_ready_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
-                                   std::memory_order_acq_rel);
+                                   std::memory_order_acquire);
 }
 
 void handle_signal(int signo)

@@ -116,7 +116,7 @@ void update_thread_main()
         }
 
         const uint8_t work =
-            g_update_work[disp].exchange(kUpdateWorkNone, std::memory_order_acq_rel);
+            g_update_work[disp].exchange(kUpdateWorkNone, std::memory_order_acquire);
         const bool do_disconnect = (work & kUpdateWorkDisconnect) != 0;
         const bool do_update = (work & kUpdateWorkRefresh) != 0;
 
@@ -171,7 +171,7 @@ void poll_thread_main()
             break;
         }
 
-        if (g_reopen_requested.exchange(false, std::memory_order_acq_rel)) {
+        if (g_reopen_requested.exchange(false, std::memory_order_acquire)) {
             std::unique_lock<std::shared_mutex> lk(g_drm_mutex);
 
             if (drm_fd >= 0) {
