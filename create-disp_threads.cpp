@@ -300,17 +300,8 @@ int run_create_disp()
 
     drm_ready.store(true, std::memory_order_release);
 
-    g_present_event_fd = eventfd(0, EFD_CLOEXEC);
-    if (g_present_event_fd < 0) {
-        perror("eventfd");
-        close(drm_fd);
-        return EXIT_FAILURE;
-    }
-
     hwcDevice = hwc2_compat_device_new(false);
     if (!hwcDevice) {
-        close(g_present_event_fd);
-        g_present_event_fd = -1;
         return EXIT_FAILURE;
     }
 
@@ -321,8 +312,6 @@ int run_create_disp()
         g_update_thread = std::thread(update_thread_main);
     } catch (...) {
         fprintf(stderr, "Failed to create update thread\n");
-        close(g_present_event_fd);
-        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -338,8 +327,6 @@ int run_create_disp()
         fprintf(stderr, "Failed to create present thread\n");
         g_running.store(false, std::memory_order_release);
         g_update_cv.notify_all();
-        close(g_present_event_fd);
-        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -350,8 +337,6 @@ int run_create_disp()
         fprintf(stderr, "Failed to create evdi event thread\n");
         g_running.store(false, std::memory_order_release);
         notify_present_thread();
-        close(g_present_event_fd);
-        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -375,8 +360,6 @@ int run_create_disp()
             g_update_thread.join();
         }
 
-        close(g_present_event_fd);
-        g_present_event_fd = -1;
         close(drm_fd);
         return EXIT_FAILURE;
     }
@@ -408,11 +391,6 @@ int run_create_disp()
     notify_present_thread();
     if (g_present_thread.joinable()) {
         g_present_thread.join();
-    }
-
-    if (g_present_event_fd >= 0) {
-        close(g_present_event_fd);
-        g_present_event_fd = -1;
     }
 
     drm_shutdown_close_fd();

@@ -28,7 +28,7 @@ std::atomic<int> g_modeset_inflight{0};
 std::thread g_present_thread;
 std::atomic<uint32_t> g_present_ready_mask{0};
 std::atomic<int> g_present_rr{0};
-int g_present_event_fd = -1;
+std::atomic<uint32_t> g_present_wake_seq{0};
 
 std::thread g_poll_thread;
 std::atomic<bool> g_running{true};
@@ -163,37 +163,20 @@ bool take_next_update_display(int& out_drv_display_id)
 
 void notify_present_thread()
 {
-    if (g_present_event_fd < 0) {
-        return;
-    }
-
-    const uint64_t one = 1;
-    ssize_t rc;
-    do {
-        rc = ::write(g_present_event_fd, &one, sizeof(one));
-    } while (rc < 0 && errno == EINTR);
+    g_present_wake_seq.fetch_add(1, std::memory_order_release);
+    g_present_wake_seq.notify_one();
 }
 
 void wait_for_present_work()
 {
-    if (g_present_event_fd < 0) {
-        return;
-    }
+    uint32_t seq = g_present_wake_seq.load(std::memory_order_acquire);
 
-    uint64_t cnt = 0;
-    for (;;) {
-        ssize_t rc = ::read(g_present_event_fd, &cnt, sizeof(cnt));
-        if (rc == (ssize_t)sizeof(cnt)) {
-            return;
-        }
-        if (rc < 0 && errno == EINTR) {
-            if (!g_running.load(std::memory_order_acquire)) {
-                return;
-            }
-            continue;
-        }
+    if (g_present_ready_mask.load(std::memory_order_acquire) != 0)
         return;
-    }
+    if (!g_running.load(std::memory_order_acquire))
+        return;
+
+    g_present_wake_seq.wait(seq, std::memory_order_relaxed);
 }
 
 void lock_present_mailbox(int drv_display_id)

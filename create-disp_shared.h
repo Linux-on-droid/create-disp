@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 
 #include <array>
@@ -351,7 +350,7 @@ extern std::atomic<int> g_modeset_inflight;
 extern std::thread g_present_thread;
 extern std::atomic<uint32_t> g_present_ready_mask;
 extern std::atomic<int> g_present_rr;
-extern int g_present_event_fd;
+extern std::atomic<uint32_t> g_present_wake_seq;
 
 extern std::thread g_poll_thread;
 extern std::atomic<bool> g_running;
