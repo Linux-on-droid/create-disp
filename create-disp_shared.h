@@ -257,7 +257,9 @@ enum class PreparePresentJobResult : uint8_t {
 };
 
 struct alignas(64) PresentMailbox {
-    std::atomic<PresentJob*> job_ptr{nullptr};
+    std::atomic<uint32_t> state{0};
+    // 0: empty, 1: filling, 2: ready, 3: draining
+    PresentJob job;
 };
 
 struct QueuedEvdiEvent {

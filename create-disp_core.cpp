@@ -208,14 +208,18 @@ bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
         return false;
     }
 
-    PresentJob* p = g_present_mailboxes[drv_display_id].job_ptr.exchange(
-        nullptr, std::memory_order_acquire);
-    if (!p) [[unlikely]] {
+    auto& mbox = g_present_mailboxes[drv_display_id];
+    uint32_t s = mbox.state.load(std::memory_order_acquire);
+    if (s != 2) [[unlikely]] {
+        return false;
+    }
+    if (!mbox.state.compare_exchange_strong(s, 3,
+        std::memory_order_acquire, std::memory_order_relaxed)) [[unlikely]] {
         return false;
     }
 
-    out = std::move(*p);
-    delete p;
+    out = std::move(mbox.job);
+    mbox.state.store(0, std::memory_order_release);
     return true;
 }
 
@@ -226,10 +230,23 @@ void enqueue_present_job(PresentJob&& j)
     }
 
     const int d = j.drv_display_id;
-    PresentJob* new_job = new PresentJob(std::move(j));
-    PresentJob* old = g_present_mailboxes[d].job_ptr.exchange(
-        new_job, std::memory_order_release);
-    delete old;
+    auto& mbox = g_present_mailboxes[d];
+
+    uint32_t s = mbox.state.load(std::memory_order_relaxed);
+    for (;;) {
+        if ((s & 1) == 0) [[likely]] {
+            if (mbox.state.compare_exchange_weak(s, 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+                break;
+            }
+            continue;
+        }
+        // s is 3 (consumer reading) — very brief, spin.
+        s = mbox.state.load(std::memory_order_relaxed);
+    }
+
+    mbox.job = std::move(j);
+    mbox.state.store(2, std::memory_order_release);
 
     const uint32_t bit = uint32_t(1) << uint32_t(d);
     const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_release);
@@ -244,9 +261,22 @@ void flush_present_jobs_for_display(int drv_display_id)
         return;
     }
 
-    PresentJob* old = g_present_mailboxes[drv_display_id].job_ptr.exchange(
-        nullptr, std::memory_order_acquire);
-    delete old;
+    auto& mbox = g_present_mailboxes[drv_display_id];
+
+    for (;;) {
+        uint32_t s = mbox.state.load(std::memory_order_acquire);
+        if ((s & 1) == 0) {
+            if (mbox.state.compare_exchange_weak(s, 0,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+                break;
+            }
+            continue;
+        }
+        // This is a rare update/reconfigure
+        s = mbox.state.load(std::memory_order_relaxed);
+    }
+
+    mbox.job = {};
 
     g_present_ready_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
                                    std::memory_order_acquire);
