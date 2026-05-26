@@ -179,19 +179,6 @@ void wait_for_present_work()
     g_present_wake_seq.wait(seq, std::memory_order_relaxed);
 }
 
-void lock_present_mailbox(int drv_display_id)
-{
-    PresentMailbox& m = g_present_mailboxes[drv_display_id];
-    while (m.lock.test_and_set(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-}
-
-void unlock_present_mailbox(int drv_display_id)
-{
-    g_present_mailboxes[drv_display_id].lock.clear(std::memory_order_release);
-}
-
 bool take_next_present_display(int& out_drv_display_id)
 {
     const uint32_t mask = g_present_ready_mask.load(std::memory_order_acquire);
@@ -224,24 +211,14 @@ bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
         return false;
     }
 
-    PresentMailbox& m = g_present_mailboxes[drv_display_id];
-    if (!m.pending.load(std::memory_order_acquire)) {
+    PresentJob* p = g_present_mailboxes[drv_display_id].job_ptr.exchange(
+        nullptr, std::memory_order_acq_rel);
+    if (!p) {
         return false;
     }
 
-    if (m.lock.test_and_set(std::memory_order_acquire)) {
-        return false;
-    }
-
-    if (!m.pending.load(std::memory_order_acquire)) {
-        m.lock.clear(std::memory_order_release);
-        return false;
-    }
-
-    out = std::move(m.job);
-    m.job = PresentJob{};
-    m.pending.store(false, std::memory_order_release);
-    m.lock.clear(std::memory_order_release);
+    out = std::move(*p);
+    delete p;
     return true;
 }
 
@@ -252,11 +229,10 @@ void enqueue_present_job(PresentJob&& j)
     }
 
     const int d = j.drv_display_id;
-    lock_present_mailbox(d);
-    PresentMailbox& m = g_present_mailboxes[d];
-    m.job = std::move(j);
-    m.pending.store(true, std::memory_order_release);
-    unlock_present_mailbox(d);
+    PresentJob* new_job = new PresentJob(std::move(j));
+    PresentJob* old = g_present_mailboxes[d].job_ptr.exchange(
+        new_job, std::memory_order_acq_rel);
+    delete old;
 
     const uint32_t bit = uint32_t(1) << uint32_t(d);
     const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_acq_rel);
@@ -271,11 +247,9 @@ void flush_present_jobs_for_display(int drv_display_id)
         return;
     }
 
-    lock_present_mailbox(drv_display_id);
-    PresentMailbox& m = g_present_mailboxes[drv_display_id];
-    m.job = PresentJob{};
-    m.pending.store(false, std::memory_order_release);
-    unlock_present_mailbox(drv_display_id);
+    PresentJob* old = g_present_mailboxes[drv_display_id].job_ptr.exchange(
+        nullptr, std::memory_order_acq_rel);
+    delete old;
 
     g_present_ready_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
                                    std::memory_order_acq_rel);

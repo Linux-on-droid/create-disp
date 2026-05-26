@@ -262,9 +262,7 @@ enum class PreparePresentJobResult : uint8_t {
 };
 
 struct alignas(64) PresentMailbox {
-    std::atomic<bool> pending{false};
-    std::atomic_flag lock = ATOMIC_FLAG_INIT;
-    PresentJob job;
+    std::atomic<PresentJob*> job_ptr{nullptr};
 };
 
 struct QueuedEvdiEvent {
@@ -428,8 +426,6 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
 
 void notify_present_thread();
 void wait_for_present_work();
-void lock_present_mailbox(int drv_display_id);
-void unlock_present_mailbox(int drv_display_id);
 bool take_next_present_display(int& out_drv_display_id);
 bool try_dequeue_present_job(int drv_display_id, PresentJob& out);
 void enqueue_present_job(PresentJob&& j);
