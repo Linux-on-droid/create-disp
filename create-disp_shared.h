@@ -271,10 +271,14 @@ class SpscRingBuffer {
     static_assert(Capacity != 0 && std::has_single_bit(Capacity), "Capacity must be power of 2");
 
 private:
+    static constexpr size_t kMask = Capacity - 1;
+
     struct alignas(64) {
         std::atomic<size_t> head{0};
         size_t cached_tail{0};
     } producer;
+
+    alignas(64) std::atomic<uint32_t> wake_seq{0};
 
     struct alignas(64) {
         std::atomic<size_t> tail{0};
@@ -286,7 +290,7 @@ private:
 public:
     bool push(const T& item) {
         size_t h = producer.head.load(std::memory_order_relaxed);
-        size_t next = (h + 1) & (Capacity - 1);
+        size_t next = (h + 1) & kMask;
         if (next == producer.cached_tail) {
             producer.cached_tail = consumer.tail.load(std::memory_order_acquire);
             if (next == producer.cached_tail) {
@@ -295,6 +299,11 @@ public:
         }
         buffer[h] = item;
         producer.head.store(next, std::memory_order_release);
+
+        if (h == consumer.tail.load(std::memory_order_acquire)) {
+            wake_seq.fetch_add(1, std::memory_order_release);
+            wake_seq.notify_one();
+        }
         return true;
     }
 
@@ -307,8 +316,33 @@ public:
             }
         }
         item = buffer[t];
-        consumer.tail.store((t + 1) & (Capacity - 1), std::memory_order_release);
+        consumer.tail.store((t + 1) & kMask, std::memory_order_release);
         return true;
+    }
+
+    template <typename Pred>
+    bool pop_wait(T& item, Pred&& pred) {
+        for (;;) {
+            if (pop(item)) {
+                return true;
+            }
+            if (!pred()) {
+                return false;
+            }
+            uint32_t seq = wake_seq.load(std::memory_order_acquire);
+            if (pop(item)) {
+                return true;
+            }
+            if (!pred()) {
+                return false;
+            }
+            wake_seq.wait(seq, std::memory_order_relaxed);
+        }
+    }
+
+    void wake() {
+        wake_seq.fetch_add(1, std::memory_order_release);
+        wake_seq.notify_all();
     }
 
     bool empty() const {
@@ -362,7 +396,6 @@ extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_b
 extern std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
 extern SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
-extern std::atomic<uint32_t> g_evdi_event_wake_seq;
 extern std::thread g_evdi_event_thread;
 
 void request_reopen();
