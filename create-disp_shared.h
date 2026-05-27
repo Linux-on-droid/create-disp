@@ -293,7 +293,7 @@ extern std::atomic<bool> g_running;
 
 extern hwc2_compat_device_t* hwcDevice;
 extern HWC2EventListener eventListener;
-extern int drm_fd;
+extern std::atomic<int> drm_fd;
 
 extern std::array<Display, kMaxDriverDisplays> g_displays;
 extern std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;

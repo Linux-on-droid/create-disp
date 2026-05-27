@@ -31,7 +31,7 @@ std::thread g_poll_thread;
 std::atomic<bool> g_running{true};
 
 hwc2_compat_device_t* hwcDevice = nullptr;
-int drm_fd = -1;
+std::atomic<int> drm_fd{-1};
 
 std::array<Display, kMaxDriverDisplays> g_displays{};
 std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;
@@ -59,16 +59,14 @@ int ioctl_retry(int fd, unsigned long req, void *arg)
 
 int drm_get_fd()
 {
-    std::shared_lock<std::shared_mutex> lk(g_drm_mutex);
-    return drm_fd;
+    return drm_fd.load(std::memory_order_acquire);
 }
 
 void drm_shutdown_close_fd()
 {
-    std::unique_lock<std::shared_mutex> lk(g_drm_mutex);
-    if (drm_fd >= 0) {
-        ::close(drm_fd);
-        drm_fd = -1;
+    int fd = drm_fd.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        ::close(fd);
     }
     drm_ready.store(false, std::memory_order_release);
 }

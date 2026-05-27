@@ -138,18 +138,18 @@ void poll_thread_main()
         if (g_reopen_requested.exchange(false, std::memory_order_acquire)) {
             std::unique_lock<std::shared_mutex> lk(g_drm_mutex);
 
-            if (drm_fd >= 0) {
-                ::close(drm_fd);
-                drm_fd = -1;
+            int old_fd = drm_fd.exchange(-1, std::memory_order_acq_rel);
+            if (old_fd >= 0) {
+                ::close(old_fd);
             }
             drm_ready.store(false, std::memory_order_release);
 
             for (int tries = 0; tries < 30; ++tries) {
                 int fd = open_evdi_lindroid_or_create();
                 if (fd >= 0) {
-                    drm_fd = fd;
+                    drm_fd.store(fd, std::memory_order_release);
                     drm_ready.store(true, std::memory_order_release);
-                    fprintf(stderr, "Reopened evdi-lindroid fd=%d\n", drm_fd);
+                    fprintf(stderr, "Reopened evdi-lindroid fd=%d\n", fd);
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -247,19 +247,23 @@ int run_create_disp()
     g_hwc_to_drv.reserve(kMaxDriverDisplays);
     g_drv_to_hwc.reserve(kMaxDriverDisplays);
 
-    drm_fd = -1;
+    drm_fd.store(-1, std::memory_order_relaxed);
     for (int i = 0; i < 5 * 1000; ++i) {
-        drm_fd = find_evdi_lindroid_device();
-        if (drm_fd >= 0) {
+        int fd = find_evdi_lindroid_device();
+        if (fd >= 0) {
+            drm_fd.store(fd, std::memory_order_relaxed);
             break;
         }
         usleep(1000);
     }
 
-    if (drm_fd < 0) {
-        drm_fd = open_evdi_lindroid_or_create();
+    if (drm_fd.load(std::memory_order_relaxed) < 0) {
+        int fd = open_evdi_lindroid_or_create();
+        if (fd >= 0) {
+            drm_fd.store(fd, std::memory_order_relaxed);
+        }
     }
-    if (drm_fd < 0) {
+    if (drm_fd.load(std::memory_order_relaxed) < 0) {
         return EXIT_FAILURE;
     }
 
@@ -277,7 +281,10 @@ int run_create_disp()
         g_update_thread = std::thread(update_thread_main);
     } catch (...) {
         fprintf(stderr, "Failed to create update thread\n");
-        close(drm_fd);
+        {
+            int fd = drm_fd.exchange(-1, std::memory_order_relaxed);
+            if (fd >= 0) ::close(fd);
+        }
         return EXIT_FAILURE;
     }
 
@@ -293,7 +300,10 @@ int run_create_disp()
         g_running.store(false, std::memory_order_release);
         g_update_wake_seq.fetch_add(1, std::memory_order_release);
         g_update_wake_seq.notify_all();
-        close(drm_fd);
+        {
+            int fd = drm_fd.exchange(-1, std::memory_order_acq_rel);
+            if (fd >= 0) ::close(fd);
+        }
         return EXIT_FAILURE;
     }
 
@@ -313,7 +323,10 @@ int run_create_disp()
             g_update_thread.join();
         }
 
-        close(drm_fd);
+        {
+            int fd = drm_fd.exchange(-1, std::memory_order_acq_rel);
+            if (fd >= 0) ::close(fd);
+        }
         return EXIT_FAILURE;
     }
 
