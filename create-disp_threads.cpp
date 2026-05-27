@@ -60,11 +60,8 @@ void present_thread_main()
                         request_display_resync(j.drv_display_id);
                         continue;
                     }
-                }
 
-                int presentFence = -1;
-                {
-                    std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
+                    int presentFence = -1;
                     err = hwc2_compat_display_present(hwcDisp, &presentFence);
                 }
 
