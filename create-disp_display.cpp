@@ -2,26 +2,13 @@
 
 namespace create_disp {
 
-Display& get_or_create_display(int display_id)
-{
-    auto it = g_displays.find(display_id);
-    if (it != g_displays.end()) {
-        return it->second;
-    }
-
-    auto [ins_it, inserted] = g_displays.try_emplace(display_id);
-    (void)inserted;
-    ins_it->second.display_id = display_id;
-    return ins_it->second;
-}
-
 void publish_display_runtime_locked(int display_id)
 {
     if (display_id < 0 || display_id >= kMaxDriverDisplays) {
         return;
     }
 
-    Display& D = get_or_create_display(display_id);
+    Display& D = g_displays[display_id];
     DisplayRuntime& R = g_display_runtime[display_id];
 
     uint64_t seq = R.seq.load(std::memory_order_relaxed);
@@ -344,7 +331,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
             std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
             std::lock(state_lk, hwc_lk);
 
-            Display& D = get_or_create_display(drv_id);
+            Display& D = g_displays[drv_id];
             D.display_id = drv_id;
             D.hwc_id = hwc_id;
             D.hwcDisplay = hwc_display;
@@ -370,7 +357,7 @@ void onHotplugReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
             std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
             std::lock(state_lk, hwc_lk);
 
-            Display& D = get_or_create_display(drv_id);
+            Display& D = g_displays[drv_id];
             D.connected = false;
             publish_display_runtime_locked(drv_id);
         }
@@ -473,7 +460,7 @@ int update_display(int display_id)
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[display_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
 
-        Display& D = get_or_create_display(display_id);
+        Display& D = g_displays[display_id];
         hwc2_compat_display_t* hwcDisp = D.hwcDisplay;
         if (!D.connected || !hwcDisp) {
             return -1;
@@ -541,7 +528,7 @@ int update_display(int display_id)
 
     {
         std::lock_guard<std::mutex> lk(g_display_mutex);
-        Display& D = get_or_create_display(display_id);
+        Display& D = g_displays[display_id];
         if (D.generation == generation) {
             D.width = target_width;
             D.height = target_height;
@@ -572,7 +559,7 @@ void disconnect_display(int drv_id)
         std::unique_lock<std::mutex> hwc_lk(g_hwc_mutex[drv_id], std::defer_lock);
         std::lock(state_lk, hwc_lk);
 
-        Display& D = get_or_create_display(drv_id);
+        Display& D = g_displays[drv_id];
         reset_display_bindings_locked(drv_id);
 
         const long long hwc_id = D.hwc_id;

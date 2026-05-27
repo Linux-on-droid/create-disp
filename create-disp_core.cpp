@@ -35,7 +35,7 @@ std::atomic<bool> g_running{true};
 hwc2_compat_device_t* hwcDevice = nullptr;
 int drm_fd = -1;
 
-std::unordered_map<int, Display> g_displays;
+std::array<Display, kMaxDriverDisplays> g_displays{};
 std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;
 
 std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments{};

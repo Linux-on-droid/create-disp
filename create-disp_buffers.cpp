@@ -195,7 +195,7 @@ void unbind_buffer_from_display_locked(int buf_id, int drv_display_id)
     }
 
     g_display_bound_buffers[drv_display_id].erase(buf_id);
-    Display& D = get_or_create_display(drv_display_id);
+    Display& D = g_displays[drv_display_id];
     D.slot_mgr.release(buf_id);
 }
 
@@ -250,10 +250,7 @@ void unbind_buffer_everywhere_locked(int buf_id)
 {
     for (int d = 0; d < kMaxDriverDisplays; ++d) {
         g_display_bound_buffers[d].erase(buf_id);
-        auto it = g_displays.find(d);
-        if (it != g_displays.end()) {
-            it->second.slot_mgr.release(buf_id);
-        }
+        g_displays[d].slot_mgr.release(buf_id);
     }
 }
 
@@ -274,7 +271,7 @@ void reset_display_bindings_locked(int drv_display_id)
         return;
     }
 
-    Display& D = get_or_create_display(drv_display_id);
+    Display& D = g_displays[drv_display_id];
 
     for (int buf_id : g_display_bound_buffers[drv_display_id]) {
         std::shared_ptr<BufferEntry> entry = get_entry_atomic(buf_id);
@@ -449,7 +446,7 @@ bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<
             return false;
         }
 
-        Display& D = get_or_create_display(drv_display_id);
+        Display& D = g_displays[drv_display_id];
         dsnap.hwcDisplay = D.hwcDisplay;
         dsnap.width = D.width;
         dsnap.height = D.height;

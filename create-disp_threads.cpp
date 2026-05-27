@@ -193,16 +193,17 @@ void poll_thread_main()
 
                 {
                     std::lock_guard<std::mutex> slk(g_display_mutex);
-                    for (auto &kv : g_displays) {
-                        reset_display_bindings_locked(kv.first);
-                        if (kv.second.connected && kv.second.hwcDisplay) {
-                            kv.second.width = 0;
-                            kv.second.height = 0;
-                            kv.second.stride = 0;
-                            publish_display_runtime_locked(kv.first);
-                            g_resync_pending[kv.first].store(true, std::memory_order_release);
+                    for (int d = 0; d < kMaxDriverDisplays; ++d) {
+                        auto& D = g_displays[d];
+                        reset_display_bindings_locked(d);
+                        if (D.connected && D.hwcDisplay) {
+                            D.width = 0;
+                            D.height = 0;
+                            D.stride = 0;
+                            publish_display_runtime_locked(d);
+                            g_resync_pending[d].store(true, std::memory_order_release);
                             if (reconnect_count < kMaxDriverDisplays) {
-                                reconnect_displays[reconnect_count++] = kv.first;
+                                reconnect_displays[reconnect_count++] = d;
                             }
                         }
                     }
@@ -268,7 +269,6 @@ int run_create_disp()
     init_free_driver_slots_once();
 
     buffer_table_reserve_ids(kExpectedHandles);
-    g_displays.reserve(kMaxDriverDisplays);
     g_hwc_to_drv.reserve(kMaxDriverDisplays);
     g_drv_to_hwc.reserve(kMaxDriverDisplays);
 

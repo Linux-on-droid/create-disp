@@ -387,7 +387,7 @@ extern hwc2_compat_device_t* hwcDevice;
 extern HWC2EventListener eventListener;
 extern int drm_fd;
 
-extern std::unordered_map<int, Display> g_displays;
+extern std::array<Display, kMaxDriverDisplays> g_displays;
 extern std::array<DisplayRuntime, kMaxDriverDisplays> g_display_runtime;
 
 extern std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments;
@@ -414,7 +414,6 @@ bool take_next_update_display(int& out_drv_display_id);
 
 SharedRwb make_rwb(int w, int h, uint32_t stride, int format, int usage, buffer_handle_t handle);
 
-Display& get_or_create_display(int display_id);
 void publish_display_runtime_locked(int display_id);
 DisplayRuntimeSnapshot snapshot_display_runtime_atomic(int display_id);
 bool display_runtime_present_ready(const DisplayRuntimeSnapshot& s, uint64_t generation);
