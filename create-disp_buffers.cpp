@@ -419,6 +419,7 @@ PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, con
     SharedRwb rwb;
     if (!entry_rwb_matches_atomic(entry, buf_w, buf_h, buf_stride, buf_format, rwb)) [[unlikely]]
         return PreparePresentJobResult::NeedSlow;
+    [[assume(rwb != nullptr)]];
 
     if (!entry->live.load(std::memory_order_acquire)) [[unlikely]]
         return PreparePresentJobResult::Abort;
