@@ -256,11 +256,6 @@ enum class PreparePresentJobResult : uint8_t {
     Abort = 2,
 };
 
-struct alignas(64) PresentMailbox {
-    std::atomic<uint32_t> state{0};
-    // 0: empty, 1: filling, 2: ready, 3: draining
-    PresentJob job;
-};
 
 
 extern std::unordered_map<long long, int> g_hwc_to_drv;
@@ -284,10 +279,6 @@ extern std::thread g_update_thread;
 extern std::atomic<bool> g_reopen_requested;
 extern std::atomic<int> g_modeset_inflight;
 
-extern std::thread g_present_thread;
-extern std::atomic<uint32_t> g_present_ready_mask;
-extern std::atomic<uint32_t> g_present_wake_seq;
-
 extern std::thread g_poll_thread;
 extern std::atomic<bool> g_running;
 
@@ -302,8 +293,6 @@ extern std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segm
 extern std::mutex g_buffer_segment_alloc_mutex;
 extern std::atomic<uint32_t> g_next_buffer_id;
 extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
-
-extern std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
 
 void request_reopen();
@@ -356,12 +345,7 @@ bool entry_rwb_matches_atomic(const std::shared_ptr<BufferEntry>& entry, int buf
 PreparePresentJobResult prepare_present_job_fast(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
 bool prepare_present_job_slow(int id, int drv_display_id, const std::shared_ptr<BufferEntry>& entry, PresentJob& out);
 
-void notify_present_thread();
-void wait_for_present_work();
-bool take_next_present_display(int& out_drv_display_id);
-bool try_dequeue_present_job(int drv_display_id, PresentJob& out);
-void enqueue_present_job(PresentJob&& j);
-void flush_present_jobs_for_display(int drv_display_id);
+bool do_present(PresentJob& j);
 
 int evdi_vsync(int drv_display_id);
 bool is_evdi_lindroid(int fd);
@@ -383,7 +367,6 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id);
 void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id);
 void create_buff(const std::array<uint8_t, 32>& data, int poll_id);
 
-void present_thread_main();
 void update_thread_main();
 void poll_thread_main();
 

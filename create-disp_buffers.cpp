@@ -597,7 +597,7 @@ void swap_to_buff(const std::array<uint8_t, 32>& data, int poll_id)
         break;
     }
 
-    enqueue_present_job(std::move(j));
+    do_present(j);
 }
 
 void destroy_buff(const std::array<uint8_t, 32>& data, int poll_id)

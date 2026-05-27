@@ -2,94 +2,6 @@
 
 namespace create_disp {
 
-void present_thread_main()
-{
-    while (g_running.load(std::memory_order_acquire)) {
-        bool did_work = false;
-        int d = -1;
-
-        while (take_next_present_display(d)) {
-            PresentJob j;
-            if (!try_dequeue_present_job(d, j)) [[unlikely]] {
-                continue;
-            }
-
-            did_work = true;
-
-            if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays || !j.rwb) {
-                continue;
-            }
-
-            DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
-            if (!display_runtime_present_ready(dsnap, j.generation)) {
-                continue;
-            }
-
-            {
-                hwc2_compat_display_t* hwcDisp = dsnap.hwcDisplay;
-                hwc2_error_t err = HWC2_ERROR_NONE;
-                {
-                    std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
-
-                    dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
-                    if (!display_runtime_present_ready(dsnap, j.generation)) {
-                        continue;
-                    }
-
-                    hwcDisp = dsnap.hwcDisplay;
-                    if (!hwcDisp) {
-                        continue;
-                    }
-
-                    uint32_t numTypes = 0;
-                    uint32_t numRequests = 0;
-
-                    err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
-                                                                -1, HAL_DATASPACE_UNKNOWN);
-                    if (err != HWC2_ERROR_NONE) {
-                        fprintf(stderr, "set_client_target failed: %d\n", (int)err);
-                        request_display_resync(j.drv_display_id);
-                        continue;
-                    }
-
-                    err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
-                    if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
-                        (void)hwc2_compat_display_accept_changes(hwcDisp);
-                    } else if (err != HWC2_ERROR_NONE) {
-                        fprintf(stderr, "validate failed: %d\n", (int)err);
-                        request_display_resync(j.drv_display_id);
-                        continue;
-                    }
-
-                    int presentFence = -1;
-                    err = hwc2_compat_display_present(hwcDisp, &presentFence);
-                }
-
-                if (err != HWC2_ERROR_NONE) {
-                    fprintf(stderr, "present failed: %d\n", (int)err);
-                    request_display_resync(j.drv_display_id);
-                    continue;
-                }
-            }
-
-            dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
-            if (!display_runtime_present_ready(dsnap, j.generation)) {
-                continue;
-            }
-
-            g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
-        }
-
-        if (!g_running.load(std::memory_order_acquire)) {
-            break;
-        }
-
-        if (!did_work) {
-            wait_for_present_work();
-        }
-    }
-}
-
 void update_thread_main()
 {
     for (;;) {
@@ -294,32 +206,13 @@ int run_create_disp()
     sd_notify(0, "STATUS=create-disp ready.");
 
     try {
-        g_present_thread = std::thread(present_thread_main);
-    } catch (...) {
-        fprintf(stderr, "Failed to create present thread\n");
-        g_running.store(false, std::memory_order_release);
-        g_update_wake_seq.fetch_add(1, std::memory_order_release);
-        g_update_wake_seq.notify_all();
-        {
-            int fd = drm_fd.exchange(-1, std::memory_order_acq_rel);
-            if (fd >= 0) ::close(fd);
-        }
-        return EXIT_FAILURE;
-    }
-
-    try {
         g_poll_thread = std::thread(poll_thread_main);
     } catch (...) {
         fprintf(stderr, "Failed to create poll thread\n");
         g_running.store(false, std::memory_order_release);
-        notify_present_thread();
-
-        if (g_present_thread.joinable()) {
-            g_present_thread.join();
-        }
+        g_update_wake_seq.fetch_add(1, std::memory_order_release);
+        g_update_wake_seq.notify_all();
         if (g_update_thread.joinable()) {
-            g_update_wake_seq.fetch_add(1, std::memory_order_release);
-            g_update_wake_seq.notify_all();
             g_update_thread.join();
         }
 
@@ -334,7 +227,6 @@ int run_create_disp()
         pause();
     }
 
-    notify_present_thread();
     g_update_wake_seq.fetch_add(1, std::memory_order_release);
     g_update_wake_seq.notify_all();
 
@@ -345,12 +237,6 @@ int run_create_disp()
     sd_notify(0, "STATUS=Stopping poll thread…");
     if (g_poll_thread.joinable()) {
         g_poll_thread.join();
-    }
-
-    sd_notify(0, "STATUS=Stopping present thread…");
-    notify_present_thread();
-    if (g_present_thread.joinable()) {
-        g_present_thread.join();
     }
 
     drm_shutdown_close_fd();

@@ -23,10 +23,6 @@ std::thread g_update_thread;
 std::atomic<bool> g_reopen_requested{false};
 std::atomic<int> g_modeset_inflight{0};
 
-std::thread g_present_thread;
-std::atomic<uint32_t> g_present_ready_mask{0};
-std::atomic<uint32_t> g_present_wake_seq{0};
-
 std::thread g_poll_thread;
 std::atomic<bool> g_running{true};
 
@@ -40,8 +36,6 @@ std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segments{};
 std::mutex g_buffer_segment_alloc_mutex;
 std::atomic<uint32_t> g_next_buffer_id{1};
 std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
-
-std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
 void request_reopen()
 {
@@ -146,123 +140,71 @@ bool take_next_update_display(int& out_drv_display_id)
     }
 }
 
-void notify_present_thread()
+bool do_present(PresentJob& j)
 {
-    g_present_wake_seq.fetch_add(1, std::memory_order_release);
-    g_present_wake_seq.notify_one();
-}
+    if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays || !j.rwb) [[unlikely]] {
+        return false;
+    }
 
-void wait_for_present_work()
-{
-    uint32_t seq = g_present_wake_seq.load(std::memory_order_acquire);
+    DisplayRuntimeSnapshot dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
+    if (!display_runtime_present_ready(dsnap, j.generation)) [[unlikely]] {
+        return false;
+    }
 
-    if (g_present_ready_mask.load(std::memory_order_acquire) != 0)
-        return;
-    if (!g_running.load(std::memory_order_acquire))
-        return;
+    {
+        hwc2_compat_display_t* hwcDisp = dsnap.hwcDisplay;
+        hwc2_error_t err = HWC2_ERROR_NONE;
+        {
+            std::lock_guard<std::mutex> hwc_lk(g_hwc_mutex[j.drv_display_id]);
 
-    g_present_wake_seq.wait(seq, std::memory_order_relaxed);
-}
+            dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
+            if (!display_runtime_present_ready(dsnap, j.generation)) [[unlikely]] {
+                return false;
+            }
 
-bool take_next_present_display(int& out_drv_display_id)
-{
-    uint32_t mask = g_present_ready_mask.load(std::memory_order_acquire);
-    for (;;) {
-        if (mask == 0) {
+            hwcDisp = dsnap.hwcDisplay;
+            if (!hwcDisp) [[unlikely]] {
+                return false;
+            }
+
+            uint32_t numTypes = 0;
+            uint32_t numRequests = 0;
+
+            err = hwc2_compat_display_set_client_target(hwcDisp, j.slot, j.rwb.get(),
+                                                        -1, HAL_DATASPACE_UNKNOWN);
+            if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                fprintf(stderr, "set_client_target failed: %d\n", (int)err);
+                request_display_resync(j.drv_display_id);
+                return false;
+            }
+
+            err = hwc2_compat_display_validate(hwcDisp, &numTypes, &numRequests);
+            if (err == HWC2_ERROR_HAS_CHANGES && (numTypes || numRequests)) {
+                (void)hwc2_compat_display_accept_changes(hwcDisp);
+            } else if (err != HWC2_ERROR_NONE) [[unlikely]] {
+                fprintf(stderr, "validate failed: %d\n", (int)err);
+                request_display_resync(j.drv_display_id);
+                return false;
+            }
+
+            int presentFence = -1;
+            err = hwc2_compat_display_present(hwcDisp, &presentFence);
+        }
+
+        if (err != HWC2_ERROR_NONE) [[unlikely]] {
+            fprintf(stderr, "present failed: %d\n", (int)err);
+            request_display_resync(j.drv_display_id);
             return false;
         }
-
-        const int d = std::countr_zero(mask);
-        const uint32_t bit = uint32_t(1) << uint32_t(d);
-
-        const uint32_t prev = g_present_ready_mask.fetch_and(~bit, std::memory_order_acquire);
-        if (prev & bit) [[likely]] {
-            out_drv_display_id = d;
-            return true;
-        }
-
-        mask = g_present_ready_mask.load(std::memory_order_acquire);
     }
-}
 
-bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
-{
-    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
+    dsnap = snapshot_display_runtime_atomic(j.drv_display_id);
+    if (!display_runtime_present_ready(dsnap, j.generation)) [[unlikely]] {
         return false;
     }
 
-    auto& mbox = g_present_mailboxes[drv_display_id];
-    uint32_t s = mbox.state.load(std::memory_order_acquire);
-    if (s != 2) [[unlikely]] {
-        return false;
-    }
-    if (!mbox.state.compare_exchange_strong(s, 3,
-        std::memory_order_acquire, std::memory_order_relaxed)) [[unlikely]] {
-        return false;
-    }
-
-    out = std::move(mbox.job);
-    mbox.state.store(0, std::memory_order_release);
+    g_resync_pending[j.drv_display_id].store(false, std::memory_order_release);
     return true;
-}
-
-void enqueue_present_job(PresentJob&& j)
-{
-    if (j.drv_display_id < 0 || j.drv_display_id >= kMaxDriverDisplays) {
-        return;
-    }
-
-    const int d = j.drv_display_id;
-    auto& mbox = g_present_mailboxes[d];
-
-    uint32_t s = mbox.state.load(std::memory_order_relaxed);
-    for (;;) {
-        if ((s & 1) == 0) [[likely]] {
-            if (mbox.state.compare_exchange_weak(s, 1,
-                std::memory_order_acquire, std::memory_order_relaxed)) {
-                break;
-            }
-            continue;
-        }
-        // s is 3 (consumer reading) — very brief, spin.
-        s = mbox.state.load(std::memory_order_relaxed);
-    }
-
-    mbox.job = std::move(j);
-    mbox.state.store(2, std::memory_order_release);
-
-    const uint32_t bit = uint32_t(1) << uint32_t(d);
-    const uint32_t prev = g_present_ready_mask.fetch_or(bit, std::memory_order_release);
-    if ((prev & bit) == 0) [[likely]] {
-        notify_present_thread();
-    }
-}
-
-void flush_present_jobs_for_display(int drv_display_id)
-{
-    if (drv_display_id < 0 || drv_display_id >= kMaxDriverDisplays) {
-        return;
-    }
-
-    auto& mbox = g_present_mailboxes[drv_display_id];
-
-    for (;;) {
-        uint32_t s = mbox.state.load(std::memory_order_acquire);
-        if ((s & 1) == 0) {
-            if (mbox.state.compare_exchange_weak(s, 0,
-                std::memory_order_acquire, std::memory_order_relaxed)) {
-                break;
-            }
-            continue;
-        }
-        // This is a rare update/reconfigure
-        s = mbox.state.load(std::memory_order_relaxed);
-    }
-
-    mbox.job = {};
-
-    g_present_ready_mask.fetch_and(~(uint32_t(1) << uint32_t(drv_display_id)),
-                                   std::memory_order_acquire);
 }
 
 void handle_signal(int signo)
@@ -271,7 +213,6 @@ void handle_signal(int signo)
     g_running.store(false, std::memory_order_release);
     g_update_wake_seq.fetch_add(1, std::memory_order_release);
     g_update_wake_seq.notify_all();
-    notify_present_thread();
 }
 
 void kick_thread_out_of_ioctl(std::thread& t)

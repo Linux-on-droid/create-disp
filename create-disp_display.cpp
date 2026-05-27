@@ -444,8 +444,6 @@ int update_display(int display_id)
         return -1;
     }
 
-    flush_present_jobs_for_display(display_id);
-
     int target_width = 0;
     int target_height = 0;
     int refresh_hz = 60;
@@ -545,8 +543,6 @@ void disconnect_display(int drv_id)
     if (drv_id < 0 || drv_id >= kMaxDriverDisplays) {
         return;
     }
-
-    flush_present_jobs_for_display(drv_id);
 
     if (drm_ready.load(std::memory_order_acquire)) {
         g_modeset_inflight.fetch_add(1, std::memory_order_release);
