@@ -369,7 +369,6 @@ extern std::shared_mutex g_drm_mutex;
 extern std::atomic<uint32_t> g_update_wake_seq;
 extern std::array<std::atomic<uint8_t>, kMaxDriverDisplays> g_update_work;
 extern std::atomic<uint32_t> g_update_pending_mask;
-extern std::atomic<int> g_update_rr;
 extern std::thread g_update_thread;
 
 extern std::atomic<bool> g_reopen_requested;
@@ -377,7 +376,6 @@ extern std::atomic<int> g_modeset_inflight;
 
 extern std::thread g_present_thread;
 extern std::atomic<uint32_t> g_present_ready_mask;
-extern std::atomic<int> g_present_rr;
 extern std::atomic<uint32_t> g_present_wake_seq;
 
 extern std::thread g_poll_thread;

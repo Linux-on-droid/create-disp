@@ -18,7 +18,6 @@ std::shared_mutex g_drm_mutex;
 std::atomic<uint32_t> g_update_wake_seq{0};
 std::array<std::atomic<uint8_t>, kMaxDriverDisplays> g_update_work = {};
 std::atomic<uint32_t> g_update_pending_mask{0};
-std::atomic<int> g_update_rr{0};
 std::thread g_update_thread;
 
 std::atomic<bool> g_reopen_requested{false};
@@ -26,7 +25,6 @@ std::atomic<int> g_modeset_inflight{0};
 
 std::thread g_present_thread;
 std::atomic<uint32_t> g_present_ready_mask{0};
-std::atomic<int> g_present_rr{0};
 std::atomic<uint32_t> g_present_wake_seq{0};
 
 std::thread g_poll_thread;
@@ -134,28 +132,23 @@ void schedule_disconnect(int drv_display_id)
 
 bool take_next_update_display(int& out_drv_display_id)
 {
-    const uint32_t mask = g_update_pending_mask.load(std::memory_order_acquire);
-    if (mask == 0) [[unlikely]] {
-        return false;
-    }
-
-    const int start = g_update_rr.fetch_add(1, std::memory_order_relaxed);
-    for (int i = 0; i < kMaxDriverDisplays; ++i) {
-        const int d = (start + i) % kMaxDriverDisplays;
-        const uint32_t bit = uint32_t(1) << uint32_t(d);
-
-        if ((mask & bit) == 0) [[likely]] {
-            continue;
+    uint32_t mask = g_update_pending_mask.load(std::memory_order_acquire);
+    for (;;) {
+        if (mask == 0) [[unlikely]] {
+            return false;
         }
+
+        const int d = std::countr_zero(mask);
+        const uint32_t bit = uint32_t(1) << uint32_t(d);
 
         const uint32_t prev = g_update_pending_mask.fetch_and(~bit, std::memory_order_acquire);
         if (prev & bit) [[likely]] {
             out_drv_display_id = d;
             return true;
         }
-    }
 
-    return false;
+        mask = g_update_pending_mask.load(std::memory_order_acquire);
+    }
 }
 
 void notify_present_thread()
@@ -178,28 +171,23 @@ void wait_for_present_work()
 
 bool take_next_present_display(int& out_drv_display_id)
 {
-    const uint32_t mask = g_present_ready_mask.load(std::memory_order_acquire);
-    if (mask == 0) {
-        return false;
-    }
-
-    const int start = g_present_rr.fetch_add(1, std::memory_order_relaxed);
-    for (int i = 0; i < kMaxDriverDisplays; ++i) {
-        const int d = (start + i) % kMaxDriverDisplays;
-        const uint32_t bit = uint32_t(1) << uint32_t(d);
-
-        if ((mask & bit) == 0) [[likely]] {
-            continue;
+    uint32_t mask = g_present_ready_mask.load(std::memory_order_acquire);
+    for (;;) {
+        if (mask == 0) {
+            return false;
         }
+
+        const int d = std::countr_zero(mask);
+        const uint32_t bit = uint32_t(1) << uint32_t(d);
 
         const uint32_t prev = g_present_ready_mask.fetch_and(~bit, std::memory_order_acquire);
         if (prev & bit) [[likely]] {
             out_drv_display_id = d;
             return true;
         }
-    }
 
-    return false;
+        mask = g_present_ready_mask.load(std::memory_order_acquire);
+    }
 }
 
 bool try_dequeue_present_job(int drv_display_id, PresentJob& out)
