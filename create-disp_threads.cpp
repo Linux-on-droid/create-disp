@@ -242,13 +242,17 @@ void poll_thread_main()
         hard_poll_failures = 0;
 
         if (poll_cmd.event != none) [[likely]] {
-            QueuedEvdiEvent q_ev;
-            q_ev.event = poll_cmd.event;
-            q_ev.poll_id = poll_cmd.poll_id;
-            q_ev.data = poll_payload;
+            if (poll_cmd.event == swap_to) [[likely]] {
+                swap_to_buff(poll_payload, poll_cmd.poll_id);
+            } else {
+                QueuedEvdiEvent q_ev;
+                q_ev.event = poll_cmd.event;
+                q_ev.poll_id = poll_cmd.poll_id;
+                q_ev.data = poll_payload;
 
-            if (!g_evdi_event_queue.push(q_ev)) [[unlikely]] {
-                fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");
+                if (!g_evdi_event_queue.push(q_ev)) [[unlikely]] {
+                    fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");
+                }
             }
         }
     }
