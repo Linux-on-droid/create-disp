@@ -262,96 +262,6 @@ struct alignas(64) PresentMailbox {
     PresentJob job;
 };
 
-struct QueuedEvdiEvent {
-    poll_event_type event;
-    int poll_id;
-    std::array<uint8_t, 32> data{};
-};
-
-template <typename T, size_t Capacity>
-class SpscRingBuffer {
-    static_assert(Capacity != 0 && std::has_single_bit(Capacity), "Capacity must be power of 2");
-
-private:
-    static constexpr size_t kMask = Capacity - 1;
-
-    struct alignas(64) {
-        std::atomic<size_t> head{0};
-        size_t cached_tail{0};
-    } producer;
-
-    alignas(64) std::atomic<uint32_t> wake_seq{0};
-
-    struct alignas(64) {
-        std::atomic<size_t> tail{0};
-        size_t cached_head{0};
-    } consumer;
-
-    T buffer[Capacity];
-
-public:
-    bool push(const T& item) {
-        size_t h = producer.head.load(std::memory_order_relaxed);
-        size_t next = (h + 1) & kMask;
-        if (next == producer.cached_tail) {
-            producer.cached_tail = consumer.tail.load(std::memory_order_acquire);
-            if (next == producer.cached_tail) {
-                return false;
-            }
-        }
-        buffer[h] = item;
-        producer.head.store(next, std::memory_order_release);
-
-        if (h == consumer.tail.load(std::memory_order_acquire)) {
-            wake_seq.fetch_add(1, std::memory_order_release);
-            wake_seq.notify_one();
-        }
-        return true;
-    }
-
-    bool pop(T& item) {
-        size_t t = consumer.tail.load(std::memory_order_relaxed);
-        if (t == consumer.cached_head) {
-            consumer.cached_head = producer.head.load(std::memory_order_acquire);
-            if (t == consumer.cached_head) {
-                return false;
-            }
-        }
-        item = buffer[t];
-        consumer.tail.store((t + 1) & kMask, std::memory_order_release);
-        return true;
-    }
-
-    template <typename Pred>
-    bool pop_wait(T& item, Pred&& pred) {
-        for (;;) {
-            if (pop(item)) {
-                return true;
-            }
-            if (!pred()) {
-                return false;
-            }
-            uint32_t seq = wake_seq.load(std::memory_order_acquire);
-            if (pop(item)) {
-                return true;
-            }
-            if (!pred()) {
-                return false;
-            }
-            wake_seq.wait(seq, std::memory_order_relaxed);
-        }
-    }
-
-    void wake() {
-        wake_seq.fetch_add(1, std::memory_order_release);
-        wake_seq.notify_all();
-    }
-
-    bool empty() const {
-        return producer.head.load(std::memory_order_acquire) ==
-               consumer.tail.load(std::memory_order_relaxed);
-    }
-};
 
 extern std::unordered_map<long long, int> g_hwc_to_drv;
 extern std::unordered_map<int, long long> g_drv_to_hwc;
@@ -395,8 +305,6 @@ extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_b
 
 extern std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
-extern SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
-extern std::thread g_evdi_event_thread;
 
 void request_reopen();
 int ioctl_retry(int fd, unsigned long req, void *arg);
@@ -477,7 +385,6 @@ void create_buff(const std::array<uint8_t, 32>& data, int poll_id);
 
 void present_thread_main();
 void update_thread_main();
-void evdi_event_thread_main();
 void poll_thread_main();
 
 void handle_signal(int signo);

@@ -43,9 +43,6 @@ std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
 
 std::array<PresentMailbox, kMaxDriverDisplays> g_present_mailboxes;
 
-SpscRingBuffer<QueuedEvdiEvent, 256> g_evdi_event_queue;
-std::thread g_evdi_event_thread;
-
 void request_reopen()
 {
     (void)g_reopen_requested.exchange(true, std::memory_order_release);
@@ -276,7 +273,6 @@ void handle_signal(int signo)
     g_running.store(false, std::memory_order_release);
     g_update_wake_seq.fetch_add(1, std::memory_order_release);
     g_update_wake_seq.notify_all();
-    g_evdi_event_queue.wake();
     notify_present_thread();
 }
 

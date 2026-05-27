@@ -126,33 +126,6 @@ void update_thread_main()
     }
 }
 
-void evdi_event_thread_main()
-{
-    const auto running = [] {
-        return g_running.load(std::memory_order_acquire);
-    };
-
-    QueuedEvdiEvent ev;
-    while (g_evdi_event_queue.pop_wait(ev, running)) {
-        switch (ev.event) {
-            case swap_to:
-                swap_to_buff(ev.data, ev.poll_id);
-                break;
-            case get_buf:
-                get_buf_from_map(ev.data, ev.poll_id);
-                break;
-            case destroy_buf:
-                destroy_buff(ev.data, ev.poll_id);
-                break;
-            case create_buf:
-                create_buff(ev.data, ev.poll_id);
-                break;
-            default:
-                break;
-        }
-    }
-}
-
 void poll_thread_main()
 {
     int hard_poll_failures = 0;
@@ -243,13 +216,18 @@ void poll_thread_main()
             if (poll_cmd.event == swap_to) [[likely]] {
                 swap_to_buff(poll_payload, poll_cmd.poll_id);
             } else {
-                QueuedEvdiEvent q_ev;
-                q_ev.event = poll_cmd.event;
-                q_ev.poll_id = poll_cmd.poll_id;
-                q_ev.data = poll_payload;
-
-                if (!g_evdi_event_queue.push(q_ev)) [[unlikely]] {
-                    fprintf(stderr, "WARNING: EVDI event queue is full! Dropping event.\n");
+                switch (poll_cmd.event) {
+                    case get_buf:
+                        get_buf_from_map(poll_payload, poll_cmd.poll_id);
+                        break;
+                    case destroy_buf:
+                        destroy_buff(poll_payload, poll_cmd.poll_id);
+                        break;
+                    case create_buf:
+                        create_buff(poll_payload, poll_cmd.poll_id);
+                        break;
+                    default:
+                        break;
                 }
             }
         }
@@ -320,27 +298,12 @@ int run_create_disp()
     }
 
     try {
-        g_evdi_event_thread = std::thread(evdi_event_thread_main);
-    } catch (...) {
-        fprintf(stderr, "Failed to create evdi event thread\n");
-        g_running.store(false, std::memory_order_release);
-        notify_present_thread();
-        g_evdi_event_queue.wake();
-        close(drm_fd);
-        return EXIT_FAILURE;
-    }
-
-    try {
         g_poll_thread = std::thread(poll_thread_main);
     } catch (...) {
         fprintf(stderr, "Failed to create poll thread\n");
         g_running.store(false, std::memory_order_release);
         notify_present_thread();
-        g_evdi_event_queue.wake();
 
-        if (g_evdi_event_thread.joinable()) {
-            g_evdi_event_thread.join();
-        }
         if (g_present_thread.joinable()) {
             g_present_thread.join();
         }
@@ -361,7 +324,6 @@ int run_create_disp()
     notify_present_thread();
     g_update_wake_seq.fetch_add(1, std::memory_order_release);
     g_update_wake_seq.notify_all();
-    g_evdi_event_queue.wake();
 
     if (g_poll_thread.joinable()) {
         kick_thread_out_of_ioctl(g_poll_thread);
@@ -370,12 +332,6 @@ int run_create_disp()
     sd_notify(0, "STATUS=Stopping poll thread…");
     if (g_poll_thread.joinable()) {
         g_poll_thread.join();
-    }
-
-    sd_notify(0, "STATUS=Stopping evdi event thread…");
-    g_evdi_event_queue.wake();
-    if (g_evdi_event_thread.joinable()) {
-        g_evdi_event_thread.join();
     }
 
     sd_notify(0, "STATUS=Stopping present thread…");
