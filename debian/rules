@@ -1,6 +1,13 @@
 #!/usr/bin/make -f
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+REAL_HWC ?= OFF
 
 %:
 	dh $@ --buildsystem=cmake --builddirectory=obj-$(DEB_HOST_GNU_TYPE)
+
+override_dh_auto_configure:
+	dh_auto_configure \
+		--buildsystem=cmake \
+		--builddirectory=obj-$(DEB_HOST_GNU_TYPE) -- \
+		-DTARGET_USES_REAL_HWC=$(REAL_HWC)
