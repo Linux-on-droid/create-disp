@@ -70,6 +70,17 @@ struct drm_evdi_vsync {
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF_CALLBACK DRM_IOWR(DRM_COMMAND_BASE + DRM_EVDI_GBM_CREATE_BUFF_CALLBACK, struct drm_evdi_create_buff_callabck)
 #define DRM_IOCTL_EVDI_VSYNC DRM_IOW(DRM_COMMAND_BASE + DRM_EVDI_VSYNC, struct drm_evdi_vsync)
 
+#ifndef TARGET_USES_REAL_HWC
+struct drm_evdi_set_power_mode {
+    int32_t display_id;
+    int32_t power_mode;
+};
+#define DRM_EVDI_SET_POWER_MODE 0x0F
+#define DRM_IOCTL_EVDI_SET_POWER_MODE DRM_IOW(DRM_COMMAND_BASE + DRM_EVDI_SET_POWER_MODE, struct drm_evdi_set_power_mode)
+int evdi_set_power_mode(int drv_display_id, int mode);
+void onDpmsReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_display_t display, int32_t powerMode);
+#endif
+
 enum poll_event_type {
     none,
     add_buf,
@@ -293,7 +304,9 @@ extern std::array<std::atomic<BufferSegment*>, kBufferMaxSegments> g_buffer_segm
 extern std::mutex g_buffer_segment_alloc_mutex;
 extern std::atomic<uint32_t> g_next_buffer_id;
 extern std::array<std::unordered_set<int>, kMaxDriverDisplays> g_display_bound_buffers;
-
+#ifndef TARGET_USES_REAL_HWC
+extern std::array<std::atomic<int>, kMaxDriverDisplays> g_display_power_mode;
+#endif
 
 void request_reopen();
 int ioctl_retry(int fd, unsigned long req, void *arg);

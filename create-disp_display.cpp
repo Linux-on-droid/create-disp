@@ -167,6 +167,53 @@ int evdi_vsync(int drv_display_id)
     return ioctl_retry(fd, DRM_IOCTL_EVDI_VSYNC, &cmd);
 }
 
+#ifndef TARGET_USES_REAL_HWC
+int evdi_set_power_mode(int drv_display_id, int mode)
+{
+    struct drm_evdi_set_power_mode cmd = {};
+    cmd.display_id = drv_display_id;
+    cmd.power_mode = mode;
+
+    int fd = drm_get_fd();
+    if (fd < 0) {
+        return -EBADF;
+    }
+
+    return ioctl_retry(fd, DRM_IOCTL_EVDI_SET_POWER_MODE, &cmd);
+}
+
+void onDpmsReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_display_t display, int32_t powerMode)
+{
+    (void)listener;
+    (void)sequenceId;
+
+    const long long hwc_id = (long long)display;
+    int drv_id = drv_id_for_hwc_atomic(hwc_id);
+
+    if (drv_id < 0) {
+        std::lock_guard<std::mutex> lk(g_display_mutex);
+        drv_id = drv_id_for_hwc(hwc_id);
+    }
+
+    if (drv_id < 0) {
+        return;
+    }
+
+    int mode = 0;
+    if (powerMode != HWC2_POWER_MODE_OFF) {
+        mode = 1;
+    }
+
+    g_display_power_mode[drv_id] = mode;
+
+    int ret = evdi_set_power_mode(drv_id, mode);
+    if (ret < 0) {
+        fprintf(stderr, "evdi_set_power_mode failed for display %d: %d (%s)\n",
+                drv_id, errno, strerror(errno));
+    }
+}
+#endif
+
 bool is_evdi_lindroid(int fd)
 {
     drmVersionPtr version = drmGetVersion(fd);
@@ -286,6 +333,10 @@ void onVsyncReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_displ
     }
 
     if (drv_id >= 0) {
+#ifndef TARGET_USES_REAL_HWC
+        if (!g_display_power_mode[drv_id])
+            return;
+#endif
         int vsync_ret = evdi_vsync(drv_id);
         if (vsync_ret < 0 && errno != ETIMEDOUT && errno != ENODEV && errno != EBADF) {
             fprintf(stderr, "vsync failed for display %d: %d (%s)\n",
@@ -389,7 +440,10 @@ void onRefreshReceived(HWC2EventListener* listener, int32_t sequenceId, hwc2_dis
 HWC2EventListener eventListener = {
     &onVsyncReceived,
     &onHotplugReceived,
-    &onRefreshReceived
+    &onRefreshReceived,
+#ifndef TARGET_USES_REAL_HWC
+    &onDpmsReceived
+#endif
 };
 
 int hz_from_period_ns(int32_t ns)
